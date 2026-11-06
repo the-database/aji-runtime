@@ -128,6 +128,7 @@ fn ensure_installs_writes_ref_and_runtime_json() {
     assert_eq!(j["trt"], dir.to_string_lossy().as_ref());
     assert_eq!(j["trt_builder"][0], f.store.pack_dir("trt-sm120", "11.4").to_string_lossy().as_ref());
     assert!(j.get("trtrtx").is_none());
+    assert_eq!(j["models"][0], f.store.pack_dir("models-mangajanai", "1.0.0").to_string_lossy().as_ref());
     // app_packs finds the model folder through the ref
     let models: Vec<PathBuf> =
         app_packs(&f.store, "mangajanai-gui").into_iter().filter(|(m, _)| m.kind == "models").map(|(_, d)| d).collect();

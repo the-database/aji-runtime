@@ -286,7 +286,7 @@ pub fn adopt(store: &Store, lock: &StoreLock, p: &IndexPack, from: &[PathBuf]) -
 }
 
 /// aji-runtime.json beside libaji (animejanai-inference `core/runtime_packs.h`): the TensorRT,
-/// builder-resource and TensorRT-RTX pack folders to load from.
+/// builder-resource and TensorRT-RTX pack folders to load from, and the app's model pack folders.
 pub fn aji_runtime_json(packs: &[(IndexPack, PathBuf)]) -> serde_json::Value {
     let s = |p: &PathBuf| serde_json::Value::String(p.to_string_lossy().into_owned());
     let mut v = serde_json::json!({ "format": 1 });
@@ -299,6 +299,12 @@ pub fn aji_runtime_json(packs: &[(IndexPack, PathBuf)]) -> serde_json::Value {
     }
     if let Some((_, d)) = packs.iter().find(|(p, _)| p.kind == "trtrtx") {
         v["trtrtx"] = s(d);
+    }
+    // For the app, not libaji (which skips keys it doesn't know): its model pack folders, so an app
+    // that only knows its libaji folder (yosh's add-on) finds the models too.
+    let models: Vec<serde_json::Value> = packs.iter().filter(|(p, _)| p.kind == "models").map(|(_, d)| s(d)).collect();
+    if !models.is_empty() {
+        v["models"] = serde_json::Value::Array(models);
     }
     v
 }
