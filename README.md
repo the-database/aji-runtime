@@ -34,6 +34,7 @@ aji-runtime unref  --app-id ID
 aji-runtime gc
 aji-runtime list
 aji-runtime path   NAME[/VERSION] [--app-id ID]
+aji-runtime show   --app-id ID
 ```
 
 - **`ensure`** installs what the app pins and writes its ref with exactly those packs. With
@@ -48,6 +49,8 @@ aji-runtime path   NAME[/VERSION] [--app-id ID]
 - **`adopt`** first takes matching files from an app's old private install. They're found by
   SHA-256 and hard-linked, or copied across drives. The old install keeps working until the app
   deletes its copies.
+- **`show`** prints the app's packs as JSON (name, version, kind, folder, installed), for its
+  updater. It changes nothing.
 - **`unref`**: uninstallers call it to drop the app's ref; it then frees what no app uses.
 
 Portable apps never write a ref and keep private packs.

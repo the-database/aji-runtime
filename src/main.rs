@@ -10,6 +10,7 @@
 //! aji-runtime gc     [--store DIR]
 //! aji-runtime list   [--store DIR]
 //! aji-runtime path   NAME[/VERSION] [--app-id ID] [--store DIR]
+//! aji-runtime show   --app-id ID [--store DIR]           (JSON: the app's packs, for its updater)
 //! ```
 //!
 //! `--progress lines` adds one event per stdout line, fields separated by single spaces:
@@ -34,7 +35,8 @@ const USAGE: &str = "usage:
   aji-runtime unref  --app-id ID [--store DIR]
   aji-runtime gc     [--store DIR]
   aji-runtime list   [--store DIR]
-  aji-runtime path   NAME[/VERSION] [--app-id ID] [--store DIR]";
+  aji-runtime path   NAME[/VERSION] [--app-id ID] [--store DIR]
+  aji-runtime show   --app-id ID [--store DIR]";
 
 #[derive(Default)]
 struct Args {
@@ -281,6 +283,48 @@ fn path(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// `show`: the app's ref as JSON on stdout, for an updater to read what this app has:
+/// `{"store", "format", "app_id", "has_ref", "app_version", "packs": [{"name", "version", "kind",
+/// "dir", "installed"}]}`. Changes nothing (a missing store reads as empty).
+fn show(a: &Args) -> Result<(), String> {
+    let id = a.app_id.clone().ok_or("--app-id is required")?;
+    aji_runtime::store::check_component("app id", &id).map_err(|e| e.to_string())?;
+    let root = match &a.store {
+        Some(p) => p.clone(),
+        None => Store::default_root().map_err(|e| e.to_string())?,
+    };
+    let store = Store::open_existing(&root);
+    let r = store.as_ref().and_then(|s| s.read_ref(&id));
+    let packs: Vec<serde_json::Value> = match (&store, &r) {
+        (Some(s), Some(r)) => r
+            .packs
+            .iter()
+            .filter_map(|k| k.split_once('/'))
+            .map(|(name, version)| {
+                let meta = s.installed(name, version);
+                serde_json::json!({
+                    "name": name,
+                    "version": version,
+                    "kind": meta.as_ref().map(|m| m.kind.clone()).unwrap_or_default(),
+                    "dir": s.pack_dir(name, version).to_string_lossy(),
+                    "installed": meta.is_some(),
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let out = serde_json::json!({
+        "store": root.to_string_lossy(),
+        "format": store.as_ref().map(|s| s.format()),
+        "app_id": id,
+        "has_ref": r.is_some(),
+        "app_version": r.as_ref().map(|r| r.app_version.clone()),
+        "packs": packs,
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let a = parse()?;
     match a.cmd.as_str() {
@@ -310,6 +354,7 @@ fn run() -> Result<(), String> {
         }
         "list" => list(&a),
         "path" => path(&a),
+        "show" => show(&a),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(())
