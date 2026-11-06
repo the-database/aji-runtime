@@ -49,6 +49,9 @@ aji-runtime show   --app-id ID
 - **`adopt`** first takes matching files from an app's old private install. They're found by
   SHA-256 and hard-linked, or copied across drives. The old install keeps working until the app
   deletes its copies.
+- **`ensure --check`** prints the plan and changes nothing: each pack is installed, adopted (its
+  old files are there with the pinned SHA-256s) or download, and the total is what would be
+  downloaded.
 - **`show`** prints the app's packs as JSON (name, version, kind, folder, installed), for its
   updater. It changes nothing.
 - **`unref`**: uninstallers call it to drop the app's ref; it then frees what no app uses.
