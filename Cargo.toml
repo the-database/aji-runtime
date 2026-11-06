@@ -1,0 +1,32 @@
+[package]
+name = "aji-runtime"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "The shared runtime pack store for libaji apps: installs each TensorRT runtime and model pack once per user, shared between apps through per-app refs"
+repository = "https://github.com/the-database/aji-runtime"
+license-file = "LICENSE"
+
+[lib]
+name = "aji_runtime"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aji-runtime"
+path = "src/main.rs"
+
+[dependencies]
+# The same crates (and versions) as MangaJaNaiCLI's setup, which this grew out of: HTTPS downloads
+# (ureq over rustls), SHA-256 checks, the 7z packs (sevenz-rust2), zip, and NVML for GPU detection.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = "3"
+sha2 = "0.11"
+sevenz-rust2 = { version = "0.24", default-features = false, features = ["util"] }
+zip = "9"
+libloading = "0.9"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
