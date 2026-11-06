@@ -134,9 +134,14 @@ pub fn ensure(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) ->
     }
     let mut adopted = Vec::new();
     let mut todo = Vec::new();
+    // `check` plans an adoption without doing it: the old files are there with the pinned SHA-256s
+    let mut would_adopt = false;
     for p in &opts.packs {
         let state = if have(store, p) {
             PlanState::Installed
+        } else if opts.check && !opts.adopt_from.is_empty() && adoptable(p, &opts.adopt_from).is_some() {
+            would_adopt = true;
+            PlanState::Adopted
         } else if !opts.check && !opts.adopt_from.is_empty() && adopt(store, &lock, p, &opts.adopt_from)? {
             adopted.push(p.key());
             PlanState::Adopted
@@ -154,7 +159,7 @@ pub fn ensure(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) ->
             downloaded_bytes: 0,
             adopted,
             gc: GcReport::default(),
-            complete: todo.is_empty(),
+            complete: todo.is_empty() && !would_adopt,
         });
     }
     for p in &todo {
@@ -258,17 +263,9 @@ fn write_pack_meta(dir: &Path, p: &IndexPack, source: &str) -> Result<()> {
 /// (in one of `from` or its `models/`). Hard-links them (copies across drives), so the old files
 /// stay until the app deletes them. Returns whether it did.
 pub fn adopt(store: &Store, lock: &StoreLock, p: &IndexPack, from: &[PathBuf]) -> Result<bool> {
-    let mut sources = Vec::new();
-    for f in &p.files {
-        let found = from.iter().flat_map(|d| [d.join(&f.path), d.join("models").join(&f.path)]).find(|c| {
-            std::fs::metadata(c).is_ok_and(|m| m.is_file() && m.len() == f.bytes)
-                && sha256_file(c).is_ok_and(|h| h == f.sha256)
-        });
-        match found {
-            Some(c) => sources.push(c),
-            None => return Ok(false),
-        }
-    }
+    let Some(sources) = adoptable(p, from) else {
+        return Ok(false);
+    };
     let work = store.tmp_folder(lock, &format!("adopt-{}", p.name))?;
     let result = (|| {
         let staged = work.join("pack");
@@ -288,6 +285,20 @@ pub fn adopt(store: &Store, lock: &StoreLock, p: &IndexPack, from: &[PathBuf]) -
     })();
     let _ = std::fs::remove_dir_all(&work);
     result.map(|_| true)
+}
+
+/// The old private file for each of `p`'s files, if all of them are there with the pinned SHA-256s
+/// (in one of `from` or its `models/`).
+pub fn adoptable(p: &IndexPack, from: &[PathBuf]) -> Option<Vec<PathBuf>> {
+    p.files
+        .iter()
+        .map(|f| {
+            from.iter().flat_map(|d| [d.join(&f.path), d.join("models").join(&f.path)]).find(|c| {
+                std::fs::metadata(c).is_ok_and(|m| m.is_file() && m.len() == f.bytes)
+                    && sha256_file(c).is_ok_and(|h| h == f.sha256)
+            })
+        })
+        .collect()
 }
 
 /// aji-runtime.json beside libaji (animejanai-inference `core/runtime_packs.h`): the TensorRT,

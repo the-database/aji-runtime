@@ -394,6 +394,36 @@ fn check_changes_nothing() {
 }
 
 #[test]
+fn check_plans_an_adoption_without_doing_it() {
+    let f = fixture("check-adopt");
+    let a = app(&f.t, "a");
+    let old = f.t.path().join("old-install");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("nvinfer_11.dll"), b"nvinfer 11.4").unwrap();
+    std::fs::write(old.join("trtexec.exe"), b"trtexec").unwrap();
+    let mut o = opts("app-a", &a, vec![f.rt1.clone(), f.models.clone()], &f.mirror);
+    o.adopt_from = vec![old.clone()];
+    o.check = true;
+    let mut states = Vec::new();
+    let mut total = None;
+    let r = ensure(&f.store, &o, &mut |e| match e {
+        Event::Plan { state, .. } => states.push(state),
+        Event::Total(t) => total = Some(t),
+        _ => {}
+    })
+    .unwrap();
+    // the runtime would be adopted (no download), the models downloaded; nothing changed yet
+    assert_eq!(states, vec![PlanState::Adopted, PlanState::Download]);
+    assert_eq!(total, Some(f.models.bytes));
+    assert!(!r.complete);
+    assert!(installed(&f.store).is_empty());
+    // with only adoptable packs, there's still work to do
+    o.packs = vec![f.rt1.clone()];
+    assert!(!run(&f.store, &o).unwrap().complete);
+    assert!(installed(&f.store).is_empty());
+}
+
+#[test]
 fn adopt_takes_matching_old_files_and_leaves_them_in_place() {
     let f = fixture("adopt");
     let a = app(&f.t, "a");
