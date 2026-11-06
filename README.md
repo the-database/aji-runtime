@@ -38,7 +38,8 @@ aji-runtime path   NAME[/VERSION] [--app-id ID]
 
 - **`ensure`** installs what the app pins and writes its ref with exactly those packs. With
   `--aji-dir`, it also writes `aji-runtime.json` beside the app's libaji, which then loads
-  TensorRT from the store. Last, it deletes packs no app uses any more.
+  TensorRT from the store. Its `models` key lists the app's model pack folders, for the app
+  itself; libaji ignores it. Last, it deletes packs no app uses any more.
   - The index is the shared runtime release's `packs-<platform>.json` (animejanai-inference
     `scripts/runtime_packs.py`, tag `runtime-<n>`), pinned by SHA-256.
   - `--want trt` takes the TensorRT runtime plus a builder pack for each GPU generation found
