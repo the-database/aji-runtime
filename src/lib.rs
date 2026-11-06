@@ -123,6 +123,11 @@ fn have(store: &Store, p: &IndexPack) -> bool {
 /// place.
 pub fn ensure(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) -> Result<EnsureResult> {
     store::check_component("app id", &opts.app_id)?;
+    // A ref is live only while its app_path exists: a wrong one would have this very run's gc free
+    // everything it just installed.
+    if !opts.app_path.exists() {
+        return Err(err(format!("--app-path {} does not exist (the app's executable)", opts.app_path.display())));
+    }
     let lock = store.lock(&mut || on(Event::Waiting))?;
     if store.may_delete() {
         store.clean_tmp(&lock);

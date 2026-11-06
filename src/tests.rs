@@ -374,6 +374,14 @@ fn concurrent_installers_wait_for_each_other() {
 }
 
 #[test]
+fn a_missing_app_path_is_refused() {
+    let f = fixture("missing-app");
+    let e = run(&f.store, &opts("app-a", &f.t.path().join("no/such.exe"), vec![f.rt1.clone()], &f.mirror)).err().unwrap();
+    assert!(e.0.contains("does not exist"), "{e}");
+    assert!(installed(&f.store).is_empty());
+}
+
+#[test]
 fn check_changes_nothing() {
     let f = fixture("check");
     let a = app(&f.t, "a");
