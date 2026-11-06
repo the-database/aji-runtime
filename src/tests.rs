@@ -322,6 +322,16 @@ fn newer_store_format_is_added_to_but_never_deleted_from() {
 }
 
 #[test]
+fn open_existing_creates_nothing() {
+    let t = Tmp::new("open-existing");
+    let root = t.path().join("nowhere");
+    assert!(Store::open_existing(&root).is_none());
+    assert!(!root.exists());
+    Store::open(&root).unwrap();
+    assert_eq!(Store::open_existing(&root).unwrap().format(), store::FORMAT);
+}
+
+#[test]
 fn the_lock_is_exclusive() {
     let f = fixture("lock");
     let held = f.store.lock(&mut || {}).unwrap();

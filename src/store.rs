@@ -173,6 +173,13 @@ impl Store {
         Ok(Store { root: root.to_path_buf(), format })
     }
 
+    /// Opens an existing store without creating anything (for lookups), or None.
+    pub fn open_existing(root: &Path) -> Option<Store> {
+        let b = fs::read(root.join("store.json")).ok()?;
+        let format = serde_json::from_slice::<StoreJson>(&b).ok()?.format;
+        Some(Store { root: root.to_path_buf(), format })
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
