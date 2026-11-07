@@ -11,12 +11,16 @@
 //! aji-runtime list   [--store DIR]
 //! aji-runtime path   NAME[/VERSION] [--app-id ID] [--store DIR]
 //! aji-runtime show   --app-id ID [--store DIR]           (JSON: the app's packs, for its updater)
+//! aji-runtime location [--json] [--store DIR]             (where the store is, and if it's there)
+//! aji-runtime move   FOLDER|--default [--progress lines] [--store DIR]
+//! aji-runtime reset  [--store DIR]                       (drop a moved store whose folder is gone)
 //! ```
 //!
 //! `--progress lines` adds one event per stdout line, fields separated by single spaces:
 //! `AJI_WAIT` (another installer holds the store), `AJI_PLAN <name>/<version> <bytes>
 //! installed|adopted|download`, `AJI_TOTAL <bytes>`, `AJI_DOWNLOAD <name>/<version> <got> <total>`,
-//! `AJI_EXTRACT <name>/<version>`, `AJI_DONE`. A failure prints `error: ...` on stderr and exits 1
+//! `AJI_EXTRACT <name>/<version>`, `AJI_MOVE <copied> <total>` (bytes, while `move` copies),
+//! `AJI_DONE`. A failure prints `error: ...` on stderr and exits 1
 //! without `AJI_DONE`. Human-readable progress always goes to stderr.
 
 use std::io::Write;
@@ -36,7 +40,10 @@ const USAGE: &str = "usage:
   aji-runtime gc     [--store DIR]
   aji-runtime list   [--store DIR]
   aji-runtime path   NAME[/VERSION] [--app-id ID] [--store DIR]
-  aji-runtime show   --app-id ID [--store DIR]";
+  aji-runtime show   --app-id ID [--store DIR]
+  aji-runtime location [--json] [--store DIR]
+  aji-runtime move   FOLDER|--default [--progress lines] [--store DIR]
+  aji-runtime reset  [--store DIR]";
 
 #[derive(Default)]
 struct Args {
@@ -55,6 +62,8 @@ struct Args {
     check: bool,
     lines: bool,
     store: Option<PathBuf>,
+    json: bool,
+    to_default: bool,
 }
 
 fn parse() -> Result<Args, String> {
@@ -83,6 +92,8 @@ fn parse() -> Result<Args, String> {
                 a.lines = true;
             }
             "--store" => a.store = Some(PathBuf::from(val()?)),
+            "--json" => a.json = true,
+            "--default" => a.to_default = true,
             "-h" | "--help" => return Err(USAGE.into()),
             s if s.starts_with("--") => return Err(format!("unknown option {s}\n{USAGE}")),
             _ => a.positional.push(x),
@@ -325,6 +336,68 @@ fn show(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
+fn store_root(a: &Args) -> Result<PathBuf, String> {
+    match &a.store {
+        Some(p) => Ok(p.clone()),
+        None => Store::default_root().map_err(|e| e.to_string()),
+    }
+}
+
+/// `location`: `default <root>`, or `moved <root> -> <target> (available|missing)`; with `--json`,
+/// `{"root", "moved", "target", "available"}`. Changes nothing.
+fn location(a: &Args) -> Result<(), String> {
+    use aji_runtime::location::{Location, location};
+    let root = store_root(a)?;
+    let loc = location(&root);
+    if a.json {
+        let (moved, target, available) = match &loc {
+            Location::Default => (false, None, true),
+            Location::Moved { target, available } => (true, Some(target.to_string_lossy().into_owned()), *available),
+        };
+        let out = serde_json::json!({"root": root.to_string_lossy(), "moved": moved, "target": target, "available": available});
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    } else {
+        match loc {
+            Location::Default => println!("default {}", root.display()),
+            Location::Moved { target, available } => {
+                println!("moved {} -> {} ({})", root.display(), target.display(), if available { "available" } else { "missing" })
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `move FOLDER` / `move --default`.
+fn move_store(a: &Args) -> Result<(), String> {
+    let root = store_root(a)?;
+    let lines = a.lines;
+    let mut waiting = || {
+        say(lines, format_args!("AJI_WAIT"));
+        eprintln!("Waiting for another installer to finish with the store...");
+    };
+    let mut last = 0u64;
+    let mut progress = |done: u64, total: u64| {
+        say(lines, format_args!("AJI_MOVE {done} {total}"));
+        if done == 0 || done == total || done - last >= 100_000_000 {
+            last = done;
+            eprintln!("Copying the store: {} of {}", mb(done), mb(total));
+        }
+    };
+    let r = match (a.to_default, a.positional.as_slice()) {
+        (true, []) => aji_runtime::location::move_back(&root, &mut waiting, &mut progress),
+        (false, [dest]) => aji_runtime::location::move_to(&root, std::path::Path::new(dest), &mut waiting, &mut progress),
+        _ => return Err(format!("move needs a folder, or --default
+{USAGE}")),
+    };
+    r.map_err(|e| e.to_string())?;
+    match aji_runtime::location::location(&root) {
+        aji_runtime::location::Location::Moved { target, .. } => eprintln!("The store is now in {} ({} links there).", target.display(), root.display()),
+        aji_runtime::location::Location::Default => eprintln!("The store is in {}.", root.display()),
+    }
+    say(lines, format_args!("AJI_DONE"));
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let a = parse()?;
     match a.cmd.as_str() {
@@ -355,6 +428,14 @@ fn run() -> Result<(), String> {
         "list" => list(&a),
         "path" => path(&a),
         "show" => show(&a),
+        "location" => location(&a),
+        "move" => move_store(&a),
+        "reset" => {
+            let root = store_root(&a)?;
+            aji_runtime::location::reset(&root).map_err(|e| e.to_string())?;
+            eprintln!("The store is at the default path {} (empty until an app installs its packs again).", root.display());
+            Ok(())
+        }
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(())

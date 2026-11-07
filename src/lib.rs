@@ -10,6 +10,7 @@
 
 pub mod fetch;
 pub mod index;
+pub mod location;
 pub mod nvml;
 pub mod store;
 
