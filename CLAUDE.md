@@ -46,3 +46,5 @@ cargo clippy --all-targets
 - Commit author is `the-database <25811902+the-database@users.noreply.github.com>`, with a short
   imperative subject and no Co-Authored-By trailer.
 - Be sparing with CI runs; the release workflow runs on `v*` tags only.
+- A release ends with `notify-downstream.yml`, which asks VideoJaNai, MangaJaNai GUI,
+  mpv-AnimeJaNai and MangaJaNaiCLI to open bump PRs (needs the `JANAI_BUMP_TOKEN` secret).
