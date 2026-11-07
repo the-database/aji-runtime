@@ -26,6 +26,11 @@ sevenz-rust2 = { version = "0.24", default-features = false, features = ["util"]
 zip = "9"
 libloading = "0.9"
 
+# Moving the store leaves a directory junction at the default path (no admin rights needed, unlike a
+# symlink); std has no API to create one.
+[target.'cfg(windows)'.dependencies]
+junction = "2"
+
 [profile.release]
 opt-level = "s"
 lto = true

@@ -22,6 +22,11 @@ Design: `plans/shared-runtime-packs.md` in the-database/animejan.ai.
 
 `AJI_RUNTIME_STORE` (or `--store`) points elsewhere, for tests.
 
+`move` puts the store on another drive: the folder above becomes a link to the new one (a
+directory junction on Windows, which needs no admin rights or Developer Mode; a symlink on Linux).
+Apps keep using the default path and the pack paths in their `aji-runtime.json`, so every app,
+old versions included, keeps working without knowing about the move.
+
 ## Program
 
 ```
@@ -35,6 +40,9 @@ aji-runtime gc
 aji-runtime list
 aji-runtime path   NAME[/VERSION] [--app-id ID]
 aji-runtime show   --app-id ID
+aji-runtime location [--json]
+aji-runtime move   FOLDER|--default [--progress lines]
+aji-runtime reset
 ```
 
 - **`ensure`** installs what the app pins and writes its ref with exactly those packs. With
@@ -55,6 +63,18 @@ aji-runtime show   --app-id ID
 - **`show`** prints the app's packs as JSON (name, version, kind, folder, installed), for its
   updater. It changes nothing.
 - **`unref`**: uninstallers call it to drop the app's ref; it then frees what no app uses.
+- **`location`** says where the store is: `default`, or `moved` with its folder and whether it's
+  reachable (a removable drive may be unplugged). `--json`: `{"root", "moved", "target",
+  "available"}`. It changes nothing.
+- **`move FOLDER`** moves the store to a new or empty folder on a local drive and links the default
+  path to it; **`move --default`** moves it back. A move copies under the store lock (`--progress
+  lines` adds `AJI_MOVE <copied> <total>`), then renames the old folder aside before switching the
+  link. On Windows that rename fails while an app has a file loaded from the store, which stops the
+  move with nothing changed. Only then is the old copy deleted.
+- **`reset`** drops the link when the store's folder is gone for good. The next install starts an
+  empty store at the default path; the old folder is never touched. It's refused while the folder
+  is there, since `move --default` keeps what's installed. Until a move back or reset, a store whose
+  folder is missing fails to open, so no app quietly re-downloads everything to the default drive.
 
 Portable apps never write a ref and keep private packs.
 

@@ -618,3 +618,164 @@ fn index_is_checked_against_its_pin() {
         "sha256": "", "bytes": 1, "files": [{ "path": "../evil.dll", "sha256": "", "bytes": 1 }] }]);
     assert!(Index::parse(&serde_json::to_vec(&v).unwrap(), None).is_err(), "path escaping the pack folder");
 }
+
+// ---- moving the store (location.rs) ---------------------------------------------------------
+// The default path becomes a link to the new folder. Every app reaches the store through that path,
+// old versions included, so after a move everything must keep working through it.
+
+use crate::location::{Location, location, move_back, move_to, reset};
+
+fn no_wait() {}
+
+fn moved(f: &Fixture) -> (PathBuf, PathBuf) {
+    let a = app(&f.t, "a");
+    run(&f.store, &opts("app-a", &a, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    (f.store.root().to_path_buf(), a)
+}
+
+#[test]
+fn a_moved_store_is_reached_through_the_default_path() {
+    let f = fixture("move");
+    let (root, a) = moved(&f);
+    let dest = f.t.path().join("other-drive").join("aji");
+    let mut seen = Vec::new();
+    move_to(&root, &dest, &mut no_wait, &mut |d, t| seen.push((d, t))).unwrap();
+
+    assert_eq!(location(&root), Location::Moved { target: dest.clone(), available: true });
+    assert!(dest.join("packs/trt-runtime/11.4/nvinfer_11.dll").is_file(), "the packs are at the new place");
+    assert_eq!(std::fs::read(root.join("packs/trt-runtime/11.4/nvinfer_11.dll")).unwrap(), b"nvinfer 11.4", "and read through the old path");
+    assert!(!PathBuf::from(format!("{}.moving", root.display())).exists(), "the old copy is gone");
+    assert_eq!(seen.last().map(|&(d, t)| d == t), Some(true), "progress reached the total");
+
+    // an app that knows nothing of the move: opens, installs, refs and gc through the default path
+    let store = Store::open(&root).unwrap();
+    assert_eq!(installed(&store), ["trt-runtime/11.4"]);
+    let b = app(&f.t, "b");
+    run(&store, &opts("app-b", &b, vec![f.models.clone()], &f.mirror)).unwrap();
+    assert!(dest.join("packs/models-mangajanai/1.0.0/a.onnx").is_file(), "new packs land at the new place");
+    assert!(dest.join("refs/app-b.json").is_file());
+    let (_, gc) = unref(&store, "app-a", &mut || {}).unwrap();
+    assert_eq!(gc.deleted, ["trt-runtime/11.4"]);
+    assert!(!dest.join("packs/trt-runtime/11.4").exists());
+    let _ = a;
+}
+
+#[test]
+fn the_store_moves_again_and_back() {
+    let f = fixture("move-again");
+    let (root, _) = moved(&f);
+    let (d1, d2) = (f.t.path().join("d1"), f.t.path().join("d2"));
+    move_to(&root, &d1, &mut no_wait, &mut |_, _| {}).unwrap();
+    move_to(&root, &d2, &mut no_wait, &mut |_, _| {}).unwrap();
+    assert_eq!(location(&root), Location::Moved { target: d2.clone(), available: true });
+    assert!(!d1.exists(), "the previous place is cleared");
+
+    move_back(&root, &mut no_wait, &mut |_, _| {}).unwrap();
+    assert_eq!(location(&root), Location::Default);
+    assert!(!d2.exists());
+    assert!(std::fs::symlink_metadata(&root).unwrap().is_dir(), "a real folder again");
+    assert_eq!(installed(&Store::open(&root).unwrap()), ["trt-runtime/11.4"]);
+    move_back(&root, &mut no_wait, &mut |_, _| {}).unwrap(); // already there: nothing to do
+}
+
+#[test]
+fn moving_to_the_default_path_moves_back() {
+    let f = fixture("move-to-default");
+    let (root, _) = moved(&f);
+    move_to(&root, &f.t.path().join("d1"), &mut no_wait, &mut |_, _| {}).unwrap();
+    move_to(&root, &root, &mut no_wait, &mut |_, _| {}).unwrap();
+    assert_eq!(location(&root), Location::Default);
+}
+
+#[test]
+fn a_move_needs_a_new_or_empty_folder_outside_the_store() {
+    let f = fixture("move-refused");
+    let (root, _) = moved(&f);
+    let full = f.t.path().join("full");
+    std::fs::create_dir_all(&full).unwrap();
+    std::fs::write(full.join("my-file.txt"), b"mine").unwrap();
+    assert!(move_to(&root, &full, &mut no_wait, &mut |_, _| {}).is_err(), "a folder with files in it");
+    assert!(full.join("my-file.txt").is_file());
+    assert!(move_to(&root, &root.join("packs").join("x"), &mut no_wait, &mut |_, _| {}).is_err(), "inside the store");
+    assert!(move_to(&root, Path::new("relative/dir"), &mut no_wait, &mut |_, _| {}).is_err(), "a relative path");
+    assert_eq!(location(&root), Location::Default, "nothing changed");
+    assert_eq!(installed(&Store::open(&root).unwrap()), ["trt-runtime/11.4"]);
+
+    let empty = f.t.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    move_to(&root, &empty, &mut no_wait, &mut |_, _| {}).unwrap();
+    assert_eq!(location(&root), Location::Moved { target: empty, available: true });
+}
+
+#[test]
+fn a_store_not_installed_yet_is_just_linked() {
+    let t = Tmp::new("move-nothing");
+    let root = t.path().join("store");
+    let dest = t.path().join("there");
+    move_to(&root, &dest, &mut no_wait, &mut |_, _| {}).unwrap();
+    assert_eq!(location(&root), Location::Moved { target: dest.clone(), available: true });
+    Store::open(&root).unwrap();
+    assert!(dest.join("store.json").is_file(), "the first install creates the store there");
+}
+
+// A moved store's drive that's gone (unplugged): nothing may quietly start a new store on the default
+// drive and download gigabytes there. Reset is the explicit way back.
+#[test]
+fn a_missing_target_fails_safely_until_reset() {
+    let f = fixture("move-missing");
+    let (root, _) = moved(&f);
+    let dest = f.t.path().join("usb");
+    move_to(&root, &dest, &mut no_wait, &mut |_, _| {}).unwrap();
+    let unplugged = f.t.path().join("usb-unplugged");
+    std::fs::rename(&dest, &unplugged).unwrap();
+
+    assert_eq!(location(&root), Location::Moved { target: dest.clone(), available: false });
+    assert!(Store::open(&root).is_err(), "no new store through a broken link");
+    assert!(move_back(&root, &mut no_wait, &mut |_, _| {}).is_err());
+    assert!(move_to(&root, &f.t.path().join("d2"), &mut no_wait, &mut |_, _| {}).is_err());
+
+    reset(&root).unwrap();
+    assert_eq!(location(&root), Location::Default);
+    let fresh = Store::open(&root).unwrap();
+    assert!(installed(&fresh).is_empty(), "an empty store at the default path");
+    assert!(unplugged.join("packs/trt-runtime/11.4/nvinfer_11.dll").is_file(), "the old copy is never touched");
+}
+
+#[test]
+fn reset_is_refused_while_the_target_is_there() {
+    let f = fixture("reset-refused");
+    let (root, _) = moved(&f);
+    let dest = f.t.path().join("d1");
+    move_to(&root, &dest, &mut no_wait, &mut |_, _| {}).unwrap();
+    assert!(reset(&root).is_err(), "move back instead, which keeps what's installed");
+    assert_eq!(location(&root), Location::Moved { target: dest, available: true });
+    reset(&Tmp::new("reset-default").path().join("store")).unwrap(); // a default store: nothing to do
+}
+
+#[cfg(windows)]
+#[test]
+fn a_store_in_use_doesnt_move() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = fixture("move-in-use");
+    let (root, _) = moved(&f);
+    let dll = root.join("packs/trt-runtime/11.4/nvinfer_11.dll");
+    // a running app with a DLL loaded from the store
+    let held = std::fs::OpenOptions::new().read(true).share_mode(1 /* FILE_SHARE_READ */).open(&dll).unwrap();
+    let dest = f.t.path().join("d1");
+    let e = move_to(&root, &dest, &mut no_wait, &mut |_, _| {}).unwrap_err().to_string();
+    assert!(e.contains("in use") && e.contains("Nothing was changed"), "{e}");
+    assert_eq!(location(&root), Location::Default);
+    assert!(!dest.exists(), "the copy is removed");
+    assert!(dll.is_file());
+    drop(held);
+    move_to(&root, &dest, &mut no_wait, &mut |_, _| {}).unwrap();
+
+    // and moving back while it's loaded from the new place
+    let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(dest.join("packs/trt-runtime/11.4/nvinfer_11.dll")).unwrap();
+    assert!(move_back(&root, &mut no_wait, &mut |_, _| {}).is_err());
+    assert_eq!(location(&root), Location::Moved { target: dest.clone(), available: true });
+    assert!(!PathBuf::from(format!("{}.new", root.display())).exists());
+    drop(held);
+    move_back(&root, &mut no_wait, &mut |_, _| {}).unwrap();
+    assert_eq!(location(&root), Location::Default);
+}
