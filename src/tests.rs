@@ -837,3 +837,222 @@ fn select_skips_pre_turing_gpus() {
     let got = idx.select(&want(&["models-mangajanai"]), &[gpu(6, 1)]).unwrap();
     assert_eq!(names(got), vec!["models-mangajanai"]);
 }
+
+// ---- a pack is the same pack whatever archive it came in (lib.rs `have`, store.rs `commit_pack`) ---
+// Each runtime-<n> release may pack unchanged files into an archive with another SHA-256. An installed
+// pack with the index's files must count as installed (or every app on a newer release downloads it
+// again and swaps it under the apps using it), and a complete pack folder is never replaced.
+
+/// The same files as `p` in another archive (stored, not deflated, and in reverse order): another
+/// asset, SHA-256 and size, the same file list.
+fn repacked(mirror: &Path, p: &IndexPack, files: &[(&str, &[u8])]) -> IndexPack {
+    let asset = format!("{}-{}-repacked.zip", p.name, p.version);
+    let path = mirror.join(&asset);
+    let mut z = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+    let o = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (n, data) in files.iter().rev() {
+        z.start_file(*n, o).unwrap();
+        z.write_all(data).unwrap();
+    }
+    z.finish().unwrap();
+    let q = IndexPack {
+        asset: asset.clone(),
+        url: format!("https://invalid.example/{asset}"),
+        sha256: sha256_file(&path).unwrap(),
+        bytes: std::fs::metadata(&path).unwrap().len(),
+        files: p.files.iter().rev().cloned().collect(),
+        ..p.clone()
+    };
+    assert_ne!(q.sha256, p.sha256);
+    q
+}
+
+const RT1_FILES: &[(&str, &[u8])] = &[("nvinfer_11.dll", b"nvinfer 11.4"), ("trtexec.exe", b"trtexec")];
+
+fn plan_states(store: &Store, o: &EnsureOptions) -> (Vec<PlanState>, Option<u64>, Result<EnsureResult>) {
+    let (mut states, mut total) = (Vec::new(), None);
+    let r = ensure(store, o, &mut |e| match e {
+        Event::Plan { state, .. } => states.push(state),
+        Event::Total(t) => total = Some(t),
+        _ => {}
+    });
+    (states, total, r)
+}
+
+#[test]
+fn a_repacked_pack_with_the_same_files_is_installed() {
+    let f = fixture("repacked");
+    let (a, b) = (app(&f.t, "a"), app(&f.t, "b"));
+    run(&f.store, &opts("app-a", &a, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    let rt1b = repacked(&f.mirror, &f.rt1, RT1_FILES);
+    let pack_json = f.store.pack_dir("trt-runtime", "11.4").join(".pack.json");
+    let before = std::fs::read(&pack_json).unwrap();
+    // B is on a newer release that repacked the same files: nothing to download (an empty mirror)
+    let empty = f.t.path().join("empty-mirror");
+    std::fs::create_dir_all(&empty).unwrap();
+    let mut o = opts("app-b", &b, vec![rt1b.clone()], &empty);
+    o.check = true;
+    let (states, total, r) = plan_states(&f.store, &o);
+    assert!(r.unwrap().complete);
+    assert_eq!((states, total), (vec![PlanState::Installed], Some(0)));
+    o.check = false;
+    let (states, total, r) = plan_states(&f.store, &o);
+    let r = r.unwrap();
+    assert_eq!((states, total, r.downloaded_bytes), (vec![PlanState::Installed], Some(0), 0));
+    assert_eq!(r.packs[0].1, f.store.pack_dir("trt-runtime", "11.4"));
+    assert_eq!(f.store.read_ref("app-b").unwrap().packs, vec!["trt-runtime/11.4"]);
+    // the folder is untouched (its .pack.json still names the first archive), and A moving to the
+    // newer release keeps it too
+    run(&f.store, &opts("app-a", &a, vec![rt1b.clone()], &empty)).unwrap();
+    assert_eq!(std::fs::read(&pack_json).unwrap(), before);
+    // and apps on the two releases switching back and forth never reinstall it
+    run(&f.store, &opts("app-b", &b, vec![f.rt1.clone()], &empty)).unwrap();
+    run(&f.store, &opts("app-b", &b, vec![rt1b], &empty)).unwrap();
+    assert_eq!(installed(&f.store), vec!["trt-runtime/11.4"]);
+    assert_eq!(std::fs::read(&pack_json).unwrap(), before);
+}
+
+#[test]
+fn installed_means_the_same_file_list() {
+    let f = fixture("same-files");
+    let a = app(&f.t, "a");
+    run(&f.store, &opts("app-a", &a, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    let m = f.store.installed("trt-runtime", "11.4").unwrap();
+    assert!(store::same_files(&m.files, &f.rt1.files));
+    assert!(f.store.check_same_files("trt-runtime", "11.4", &f.rt1.files).is_ok());
+    let mut rev = f.rt1.files.clone();
+    rev.reverse();
+    rev[0].sha256 = rev[0].sha256.to_ascii_uppercase();
+    assert!(store::same_files(&m.files, &rev), "order and hex case don't matter");
+    for change in 0..5 {
+        let mut other = f.rt1.files.clone();
+        match change {
+            0 => other[0].sha256 = sha256_bytes(b"other"),
+            1 => other[0].bytes += 1,
+            2 => other[0].path = "renamed.dll".into(),
+            3 => {
+                other.pop();
+            }
+            _ => other.push(PackFile { path: "extra.dll".into(), sha256: sha256_bytes(b"x"), bytes: 1 }),
+        }
+        assert!(!store::same_files(&m.files, &other), "change {change}");
+        assert!(f.store.check_same_files("trt-runtime", "11.4", &other).is_err(), "change {change}");
+    }
+    let dup = vec![f.rt1.files[0].clone(), f.rt1.files[0].clone()];
+    assert!(!store::same_files(&dup, &dup), "a list with a path twice is never the same");
+}
+
+#[test]
+fn a_version_installed_with_other_files_is_refused_and_left_alone() {
+    let f = fixture("other-files");
+    let (a, b) = (app(&f.t, "a"), app(&f.t, "b"));
+    run(&f.store, &opts("app-a", &a, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    let dir = f.store.pack_dir("trt-runtime", "11.4");
+    let before = std::fs::read(dir.join(".pack.json")).unwrap();
+    // a (broken) index that pins other files under the installed name/version
+    let mirror2 = f.t.path().join("mirror2");
+    let other = make_pack(&mirror2, "trt-runtime", "11.4", "trt", None, &[("nvinfer_11.dll", b"nvinfer 11.4 rebuilt"), ("trtexec.exe", b"trtexec")]);
+    let models = make_pack(&mirror2, "models-mangajanai", "1.0.0", "models", None, &[("a.onnx", b"model a"), ("b.onnx", b"model b")]);
+    for check in [true, false] {
+        let mut o = opts("app-b", &b, vec![models.clone(), other.clone()], &mirror2);
+        o.check = check;
+        let (states, _, r) = plan_states(&f.store, &o);
+        let e = r.err().unwrap();
+        assert!(e.0.contains("trt-runtime/11.4") && e.0.contains("other files") && e.0.contains("never replaced"), "{e}");
+        assert!(states.is_empty(), "refused before planning, downloading or adopting anything");
+    }
+    // A's pack and the store are as they were; B has no ref and nothing of B's was installed
+    assert_eq!(std::fs::read(dir.join(".pack.json")).unwrap(), before);
+    assert_eq!(std::fs::read(dir.join("nvinfer_11.dll")).unwrap(), b"nvinfer 11.4");
+    assert!(f.store.read_ref("app-b").is_none());
+    assert_eq!(installed(&f.store), vec!["trt-runtime/11.4"]);
+    assert_eq!(std::fs::read_dir(f.store.tmp_dir()).unwrap().count(), 0);
+    // A keeps working with its own index
+    run(&f.store, &opts("app-a", &a, vec![f.rt1.clone()], &f.mirror)).unwrap();
+}
+
+#[test]
+fn an_unreadable_pack_json_is_never_replaced() {
+    let f = fixture("bad-pack-json");
+    let (a, b) = (app(&f.t, "a"), app(&f.t, "b"));
+    run(&f.store, &opts("app-a", &a, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    let dir = f.store.pack_dir("trt-runtime", "11.4");
+    std::fs::write(dir.join(".pack.json"), b"{ not json").unwrap();
+    let e = run(&f.store, &opts("app-b", &b, vec![f.rt1.clone()], &f.mirror)).err().unwrap();
+    assert!(e.0.contains("can't be read") && e.0.contains("never replaced"), "{e}");
+    assert_eq!(std::fs::read(dir.join(".pack.json")).unwrap(), b"{ not json");
+    assert_eq!(std::fs::read(dir.join("nvinfer_11.dll")).unwrap(), b"nvinfer 11.4");
+}
+
+#[test]
+fn commit_pack_never_replaces_a_complete_pack() {
+    let f = fixture("commit-complete");
+    let a = app(&f.t, "a");
+    run(&f.store, &opts("app-a", &a, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    let dir = f.store.pack_dir("trt-runtime", "11.4");
+    let before = std::fs::read(dir.join(".pack.json")).unwrap();
+    let lock = f.store.lock(&mut || {}).unwrap();
+    let stage = |name: &str, files: &[PackFile], data: &[u8]| {
+        let s = f.store.tmp_folder(&lock, "stage").unwrap();
+        for p in files {
+            std::fs::write(s.join(&p.path), data).unwrap();
+        }
+        let meta = PackMeta {
+            format: store::FORMAT,
+            name: name.into(),
+            version: "11.4".into(),
+            kind: "trt".into(),
+            platform: index::platform().into(),
+            source: "test".into(),
+            sha256: "0".repeat(64),
+            files: files.to_vec(),
+        };
+        std::fs::write(s.join(".pack.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        s
+    };
+    // other files: refused, and nothing in the store changes
+    let mut other = f.rt1.files.clone();
+    other[0].sha256 = sha256_bytes(b"other");
+    let s = stage("trt-runtime", &other, b"other");
+    let e = f.store.commit_pack(&lock, &s, "trt-runtime", "11.4").err().unwrap();
+    assert!(e.0.contains("other files"), "{e}");
+    assert_eq!(std::fs::read(dir.join(".pack.json")).unwrap(), before);
+    assert_eq!(std::fs::read(dir.join("nvinfer_11.dll")).unwrap(), b"nvinfer 11.4");
+    // the same files: the installed folder is kept as it is, the staged copy dropped
+    let s = stage("trt-runtime", &f.rt1.files, b"unused");
+    assert_eq!(f.store.commit_pack(&lock, &s, "trt-runtime", "11.4").unwrap(), dir);
+    assert!(!s.exists());
+    assert_eq!(std::fs::read(dir.join(".pack.json")).unwrap(), before);
+    assert_eq!(std::fs::read(dir.join("nvinfer_11.dll")).unwrap(), b"nvinfer 11.4");
+    // a staged folder without a readable .pack.json is refused
+    let s = stage("trt-runtime", &f.rt1.files, b"x");
+    std::fs::write(s.join(".pack.json"), b"{").unwrap();
+    assert!(f.store.commit_pack(&lock, &s, "trt-runtime", "11.4").is_err());
+    // an incomplete leftover (no .pack.json) is still replaced
+    let half = f.store.pack_dir("trt-sm86", "11.4");
+    std::fs::create_dir_all(&half).unwrap();
+    std::fs::write(half.join("x.dll"), b"trunc").unwrap();
+    let s = stage("trt-sm86", &f.sm120.files, b"sm86");
+    assert_eq!(f.store.commit_pack(&lock, &s, "trt-sm86", "11.4").unwrap(), half);
+    assert!(f.store.is_complete("trt-sm86", "11.4"));
+    assert!(!half.join("x.dll").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn a_pack_in_use_is_not_touched_by_a_newer_release() {
+    use std::os::windows::fs::OpenOptionsExt;
+    // the case that broke: app A has the pack's DLLs loaded while app B, on a newer runtime release
+    // with the same files in another archive, installs
+    let f = fixture("repacked-in-use");
+    let (a, b) = (app(&f.t, "a"), app(&f.t, "b"));
+    run(&f.store, &opts("app-a", &a, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    let dll = f.store.pack_dir("trt-runtime", "11.4").join("nvinfer_11.dll");
+    let held = std::fs::OpenOptions::new().read(true).share_mode(1 /* FILE_SHARE_READ */).open(&dll).unwrap();
+    let rt1b = repacked(&f.mirror, &f.rt1, RT1_FILES);
+    let r = run(&f.store, &opts("app-b", &b, vec![rt1b], &f.mirror)).unwrap();
+    assert_eq!(r.downloaded_bytes, 0);
+    assert!(r.gc.in_use.is_empty());
+    assert!(dll.is_file());
+    drop(held);
+}

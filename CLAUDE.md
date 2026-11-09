@@ -29,6 +29,10 @@ store rule has a test in `src/tests.rs`. Add one for any change.
 - Pack folders are immutable, and complete only with `.pack.json`, which is written last. New
   packs are staged in `tmp/` and renamed in. Deletions are renamed out to `tmp/` first, and a
   Windows pack with a file in use is skipped whole.
+- A complete pack is installed once and only gc deletes it. It counts as installed when its
+  `.pack.json` lists the index's files (paths, sizes, SHA-256s), whatever archive SHA-256 the index
+  pins: a later runtime release may repack the same files. An index with other files under an
+  installed name/version is an error; `commit_pack` never replaces a complete pack.
 - A store with a newer `store.json` format is added to but never deleted from.
 - The `--progress lines` protocol and the `aji-runtime.json` format are contracts with apps and
   with libaji. Extend them; don't change existing lines or keys.

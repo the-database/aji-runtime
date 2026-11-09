@@ -114,9 +114,16 @@ pub struct EnsureResult {
     pub complete: bool,
 }
 
-/// Whether the store holds `p` exactly as the index pins it.
-fn have(store: &Store, p: &IndexPack) -> bool {
-    store.installed(&p.name, &p.version).is_some_and(|m| m.sha256 == p.sha256)
+/// Whether the store holds `p`: a complete pack of its name and version whose `.pack.json` lists
+/// exactly the index's files (paths, sizes, SHA-256s). The archive's SHA-256 doesn't matter: a later
+/// runtime release may repack the same files, and they're still the same pack. A complete pack with
+/// other files is an error, since pack folders are never replaced ([`Store::commit_pack`]).
+fn have(store: &Store, p: &IndexPack) -> Result<bool> {
+    if !store.is_complete(&p.name, &p.version) {
+        return Ok(false);
+    }
+    store.check_same_files(&p.name, &p.version, &p.files)?;
+    Ok(true)
 }
 
 /// Installs the app's packs, writes its ref (exactly these packs) and aji-runtime.json, then
@@ -137,8 +144,13 @@ pub fn ensure(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) ->
     let mut todo = Vec::new();
     // `check` plans an adoption without doing it: the old files are there with the pinned SHA-256s
     let mut would_adopt = false;
+    // A pack installed with other files stops everything before anything is changed or downloaded.
+    let mut present = Vec::with_capacity(opts.packs.len());
     for p in &opts.packs {
-        let state = if have(store, p) {
+        present.push(have(store, p)?);
+    }
+    for (p, present) in opts.packs.iter().zip(present) {
+        let state = if present {
             PlanState::Installed
         } else if opts.check && !opts.adopt_from.is_empty() && adoptable(p, &opts.adopt_from).is_some() {
             would_adopt = true;

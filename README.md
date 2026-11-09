@@ -55,6 +55,10 @@ aji-runtime reset
     (falling back to PTX). GPUs below compute capability 7.5 (older than the RTX 20 / GTX 16
     series) are skipped, since TensorRT doesn't run on them; with only such GPUs it fails. `trtrtx` takes the TensorRT-RTX runtime; any other value is a pack
     name.
+  - A pack is installed when its folder's `.pack.json` lists the index's files (paths, sizes,
+    SHA-256s), whatever archive it came in, so a newer runtime release with the same files
+    downloads nothing. A pack folder is never replaced: an index with other files under an
+    installed name and version fails.
 - **`adopt`** first takes matching files from an app's old private install. They're found by
   SHA-256 and hard-linked, or copied across drives. The old install keeps working until the app
   deletes its copies.

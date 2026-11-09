@@ -18,6 +18,9 @@
 //! - A pack is deleted by renaming it into `tmp/` first, so `packs/` only ever holds complete
 //!   packs. On Windows, a pack with a file in use (a loaded DLL) is skipped and retried by the
 //!   next gc, never half-deleted.
+//! - A complete pack is installed once and never replaced: it counts as installed when its
+//!   `.pack.json` lists the index's files, whatever archive they came in, and installing the same
+//!   name/version with other files fails ([`Store::commit_pack`]). Only gc deletes complete packs.
 //! - A store whose format is newer than [`FORMAT`] is read and added to, but nothing is deleted.
 
 use std::collections::BTreeSet;
@@ -55,7 +58,8 @@ pub struct PackMeta {
     pub platform: String,
     /// The archive it came from (URL, or `adopted from <folder>`).
     pub source: String,
-    /// The archive's SHA-256 (the index's pin), so a re-pinned pack is noticed.
+    /// The SHA-256 of the archive it was installed from (the index's pin then). For information
+    /// only: a later index may pin another archive of the same files, which is the same pack.
     pub sha256: String,
     pub files: Vec<PackFile>,
 }
@@ -250,6 +254,30 @@ impl Store {
         serde_json::from_slice(&b).ok()
     }
 
+    /// Whether `packs/<name>/<version>` is a complete pack (has its `.pack.json`), readable or not.
+    pub fn is_complete(&self, name: &str, version: &str) -> bool {
+        self.pack_dir(name, version).join(".pack.json").is_file()
+    }
+
+    /// Checks that the complete pack `name/version` holds exactly `files` (by its `.pack.json`).
+    /// An error names the conflict: the folder holds other files, or its `.pack.json` can't be read.
+    pub fn check_same_files(&self, name: &str, version: &str, files: &[PackFile]) -> Result<()> {
+        let key = pack_key(name, version);
+        match self.installed(name, version) {
+            Some(m) if same_files(&m.files, files) => Ok(()),
+            Some(_) => Err(err(format!(
+                "the pack store already has {key} with other files than the runtime index lists for it; an \
+                 installed pack is never replaced (the index reuses a version for different files: a runtime \
+                 release error)"
+            ))),
+            None => Err(err(format!(
+                "the pack store's {key} has a .pack.json that can't be read ({}); an installed pack is never \
+                 replaced",
+                self.pack_dir(name, version).join(".pack.json").display()
+            ))),
+        }
+    }
+
     /// Every complete pack: (meta, folder, bytes on disk).
     pub fn packs(&self) -> Vec<(PackMeta, PathBuf, u64)> {
         let mut out = Vec::new();
@@ -344,15 +372,26 @@ impl Store {
     }
 
     /// Moves a complete pack folder (its `.pack.json` already written) from tmp/ into packs/.
+    ///
+    /// A complete pack already there is never replaced or deleted: other apps use it, and on Windows
+    /// may have its DLLs loaded. If it holds the same files, it's kept and `staged` is dropped;
+    /// otherwise (other files, or an unreadable `.pack.json`) this fails and changes nothing.
     pub fn commit_pack(&self, _lock: &StoreLock, staged: &Path, name: &str, version: &str) -> Result<PathBuf> {
         check_component("pack name", name)?;
         check_component("pack version", version)?;
-        if !staged.join(".pack.json").is_file() {
-            return Err(err(format!("{}: no .pack.json", staged.display())));
-        }
+        let meta = staged.join(".pack.json");
+        let staged_meta: PackMeta = fs::read(&meta)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .ok_or_else(|| err(format!("{}: no .pack.json", staged.display())))?;
         let dest = self.pack_dir(name, version);
+        if self.is_complete(name, version) {
+            self.check_same_files(name, version, &staged_meta.files)?;
+            let _ = fs::remove_dir_all(staged);
+            return Ok(dest);
+        }
         if dest.exists() {
-            // An incomplete leftover (a complete pack is never installed twice): out of the way.
+            // An incomplete leftover (no .pack.json): out of the way.
             self.remove_pack_folder(&dest)?;
         }
         fs::create_dir_all(dest.parent().unwrap()).map_err(|e| err(format!("{}: {e}", dest.display())))?;
@@ -417,6 +456,18 @@ impl Store {
         }
         Ok(report)
     }
+}
+
+/// Whether two file lists are the same files: the same paths with the same sizes and SHA-256s, in
+/// any order.
+pub fn same_files(a: &[PackFile], b: &[PackFile]) -> bool {
+    let key = |l: &[PackFile]| {
+        let mut v: Vec<(String, u64, String)> = l.iter().map(|f| (f.path.clone(), f.bytes, f.sha256.to_ascii_lowercase())).collect();
+        v.sort();
+        v
+    };
+    let (ka, kb) = (key(a), key(b));
+    ka == kb && ka.windows(2).all(|w| w[0].0 != w[1].0)
 }
 
 /// Whether a file in `dir` is in use in a way that stops it from being deleted. On Windows a
