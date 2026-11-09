@@ -34,6 +34,13 @@ store rule has a test in `src/tests.rs`. Add one for any change.
   pins: a later runtime release may repack the same files. An index with other files under an
   installed name/version is an error; `commit_pack` never replaces a complete pack.
 - A store with a newer `store.json` format is added to but never deleted from.
+- Every change to the store is a rename (packs in and out whole, refs and `aji-runtime.json` by
+  `write_atomic`): that's what lets `ensure --check` and `show` read without the lock. Keep it so.
+- `ensure --check` is complete only if an ensure would change nothing, the app's ref included
+  (exactly its packs, its `app_path`): updaters and launchers ensure again only when it isn't.
+- Downloads hold the lock, so they can't hang: connect and stall timeouts and retries in
+  `fetch.rs`. Waiting for the lock gives up after `LOCK_WAIT` (`unref`: `UNREF_LOCK_WAIT`), never
+  by breaking it.
 - The `--progress lines` protocol and the `aji-runtime.json` format are contracts with apps and
   with libaji. Extend them; don't change existing lines or keys.
 

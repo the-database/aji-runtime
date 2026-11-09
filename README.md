@@ -59,14 +59,27 @@ aji-runtime reset
     SHA-256s), whatever archive it came in, so a newer runtime release with the same files
     downloads nothing. A pack folder is never replaced: an index with other files under an
     installed name and version fails.
+  - Downloads give up connecting after 30 s, and fail when no data arrives for 30 s (a slow
+    download that keeps coming is fine). Up to 4 retries in a row (after 2, 5, 15 and 30 s), each
+    resuming where the last stopped (HTTP Range), then the whole file's SHA-256 is checked as
+    always. A retry that got further starts the count over, up to 20 attempts in all.
+  - Only one app changes the store at a time. One that finds it busy prints `AJI_WAIT` once and
+    waits up to an hour (`unref`: 5 minutes, since its uninstaller waits too; the ref dies with the
+    app anyway), then fails with nothing changed. The lock is never broken.
 - **`adopt`** first takes matching files from an app's old private install. They're found by
   SHA-256 and hard-linked, or copied across drives. The old install keeps working until the app
   deletes its copies.
 - **`ensure --check`** prints the plan and changes nothing: each pack is installed, adopted (its
   old files are there with the pinned SHA-256s) or download, and the total is what would be
-  downloaded.
-- **`show`** prints the app's packs as JSON (name, version, kind, folder, installed), for its
-  updater. It changes nothing.
+  downloaded. It ends with `AJI_DONE` (complete) only when nothing would be installed and the
+  app's ref lists exactly these packs for this `--app-path` (and, with `--aji-dir`,
+  `aji-runtime.json` is what an ensure writes). A ref for another path (a moved or renamed
+  AppImage) is dead once that path is gone, and the next gc frees its packs, so an updater that
+  ensures on an incomplete check writes it again. It takes no lock, so it never waits for another
+  app's download: every change to the store is a rename, so it sees each pack and ref whole.
+- **`show`** prints the app's packs as JSON (name, version, kind, folder, installed), and the
+  ref's `app_version` and `app_path` (null without a ref), for its updater or launcher. It
+  changes nothing.
 - **`unref`**: uninstallers call it to drop the app's ref; it then frees what no app uses.
 - **`location`** says where the store is: `default`, or `moved` with its folder and whether it's
   reachable (a removable drive may be unplugged). `--json`: `{"root", "moved", "target",

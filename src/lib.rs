@@ -14,6 +14,7 @@ pub mod location;
 pub mod nvml;
 pub mod store;
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -100,7 +101,9 @@ pub struct EnsureOptions {
     pub adopt_from: Vec<PathBuf>,
     /// Where the app's libaji is: aji-runtime.json is written there.
     pub aji_dir: Option<PathBuf>,
-    /// Report the plan only; change nothing.
+    /// Report the plan only; change nothing. Doesn't take the store lock (so it never waits for
+    /// another app's download), and is complete only if the app's ref and aji-runtime.json are
+    /// what an ensure would write.
     pub check: bool,
 }
 
@@ -110,8 +113,11 @@ pub struct EnsureResult {
     pub downloaded_bytes: u64,
     pub adopted: Vec<String>,
     pub gc: GcReport,
-    /// False after `check` when something would have to be installed.
+    /// False after `check` when something would have to be installed, or `stale` isn't empty.
     pub complete: bool,
+    /// After `check`: what else an ensure would put right (the app's ref is missing, lists other
+    /// packs or names another app path; aji-runtime.json is missing or different).
+    pub stale: Vec<String>,
 }
 
 /// Whether the store holds `p`: a complete pack of its name and version whose `.pack.json` lists
@@ -136,14 +142,15 @@ pub fn ensure(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) ->
     if !opts.app_path.exists() {
         return Err(err(format!("--app-path {} does not exist (the app's executable)", opts.app_path.display())));
     }
+    if opts.check {
+        return check(store, opts, on);
+    }
     let lock = store.lock(&mut || on(Event::Waiting))?;
     if store.may_delete() {
         store.clean_tmp(&lock);
     }
     let mut adopted = Vec::new();
     let mut todo = Vec::new();
-    // `check` plans an adoption without doing it: the old files are there with the pinned SHA-256s
-    let mut would_adopt = false;
     // A pack installed with other files stops everything before anything is changed or downloaded.
     let mut present = Vec::with_capacity(opts.packs.len());
     for p in &opts.packs {
@@ -152,10 +159,7 @@ pub fn ensure(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) ->
     for (p, present) in opts.packs.iter().zip(present) {
         let state = if present {
             PlanState::Installed
-        } else if opts.check && !opts.adopt_from.is_empty() && adoptable(p, &opts.adopt_from).is_some() {
-            would_adopt = true;
-            PlanState::Adopted
-        } else if !opts.check && !opts.adopt_from.is_empty() && adopt(store, &lock, p, &opts.adopt_from)? {
+        } else if !opts.adopt_from.is_empty() && adopt(store, &lock, p, &opts.adopt_from)? {
             adopted.push(p.key());
             PlanState::Adopted
         } else {
@@ -166,15 +170,6 @@ pub fn ensure(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) ->
     }
     let total: u64 = todo.iter().map(|p| p.bytes).sum();
     on(Event::Total(total));
-    if opts.check {
-        return Ok(EnsureResult {
-            packs: opts.packs.iter().map(|p| (p.clone(), store.pack_dir(&p.name, &p.version))).collect(),
-            downloaded_bytes: 0,
-            adopted,
-            gc: GcReport::default(),
-            complete: todo.is_empty() && !would_adopt,
-        });
-    }
     for p in &todo {
         install(store, &lock, p, opts.mirror.as_deref(), on)?;
     }
@@ -194,7 +189,98 @@ pub fn ensure(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) ->
     }
     let gc = store.gc(&lock)?;
     on(Event::Done);
-    Ok(EnsureResult { packs, downloaded_bytes: total, adopted, gc, complete: true })
+    Ok(EnsureResult { packs, downloaded_bytes: total, adopted, gc, complete: true, stale: Vec::new() })
+}
+
+/// `ensure --check`: the plan, changing nothing and without the store lock, so an updater's check
+/// never waits for another app's long download. That's safe because the store changes only by
+/// renames (a pack folder in or out whole, refs and aji-runtime.json replaced whole): this sees each
+/// pack and ref as it was before a change or after it. A pack that another app's gc renames out
+/// while this looks at it reads as not installed.
+///
+/// Complete only when nothing would be installed and the app's ref lists exactly these packs for
+/// this `app_path` (and, with `aji_dir`, aji-runtime.json is what an ensure writes). A ref that names
+/// the app's old path (a moved or renamed AppImage) is dead for gc, which then frees the packs: such
+/// a check is incomplete, so the updater's ensure writes the ref again.
+fn check(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) -> Result<EnsureResult> {
+    let mut present = Vec::with_capacity(opts.packs.len());
+    for p in &opts.packs {
+        present.push(match have(store, p) {
+            Ok(b) => b,
+            // gone meanwhile (another app's gc): not installed
+            Err(_) if !store.is_complete(&p.name, &p.version) => false,
+            Err(e) => return Err(e),
+        });
+    }
+    let (mut total, mut todo) = (0, false);
+    for (p, present) in opts.packs.iter().zip(present) {
+        // an adoption is planned without doing it: the old files are there with the pinned SHA-256s
+        let state = if present {
+            PlanState::Installed
+        } else if !opts.adopt_from.is_empty() && adoptable(p, &opts.adopt_from).is_some() {
+            todo = true;
+            PlanState::Adopted
+        } else {
+            todo = true;
+            total += p.bytes;
+            PlanState::Download
+        };
+        on(Event::Plan { pack: p, state });
+    }
+    on(Event::Total(total));
+    let packs: Vec<(IndexPack, PathBuf)> =
+        opts.packs.iter().map(|p| (p.clone(), store.pack_dir(&p.name, &p.version))).collect();
+    let stale = stale(store, opts, &packs);
+    Ok(EnsureResult {
+        packs,
+        downloaded_bytes: 0,
+        adopted: Vec::new(),
+        gc: GcReport::default(),
+        complete: !todo && stale.is_empty(),
+        stale,
+    })
+}
+
+/// What an ensure would write differently from what's there: the app's ref (it must list exactly
+/// these packs and name this app_path) and aji-runtime.json.
+fn stale(store: &Store, opts: &EnsureOptions, packs: &[(IndexPack, PathBuf)]) -> Vec<String> {
+    let mut out = Vec::new();
+    match store.read_ref(&opts.app_id) {
+        None => out.push(format!("{} has no ref in the store", opts.app_id)),
+        Some(r) => {
+            let want: Vec<String> = opts.packs.iter().map(IndexPack::key).collect();
+            let have: BTreeSet<&str> = r.packs.iter().map(String::as_str).collect();
+            if have != want.iter().map(String::as_str).collect() {
+                out.push(format!("{}'s ref lists other packs ({})", opts.app_id, r.packs.join(", ")));
+            }
+            if !same_path(&r.app_path, &opts.app_path) {
+                out.push(format!("{}'s ref names another app path ({})", opts.app_id, r.app_path.display()));
+            }
+        }
+    }
+    if let Some(dir) = &opts.aji_dir {
+        let file = dir.join("aji-runtime.json");
+        let current = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+        if current.as_ref() != Some(&aji_runtime_json(packs)) {
+            out.push(format!("{} is missing or names other packs", file.display()));
+        }
+    }
+    out
+}
+
+/// Whether two app paths are the same (made absolute, and case-insensitively on Windows).
+fn same_path(a: &Path, b: &Path) -> bool {
+    let parts = |p: &Path| -> Vec<String> {
+        std::path::absolute(p)
+            .unwrap_or_else(|_| p.to_path_buf())
+            .components()
+            .map(|c| {
+                let s = c.as_os_str().to_string_lossy();
+                if cfg!(windows) { s.to_lowercase() } else { s.into_owned() }
+            })
+            .collect()
+    };
+    parts(a) == parts(b)
 }
 
 /// Downloads (or copies from `mirror`), verifies and installs one pack.
@@ -344,9 +430,15 @@ pub fn write_aji_runtime_json(aji_dir: &Path, packs: &[(IndexPack, PathBuf)]) ->
     store::write_atomic(&aji_dir.join("aji-runtime.json"), &b)
 }
 
-/// Drops an app's ref (its uninstaller calls this), then frees what no app uses.
+/// How long [`unref`] waits for another app's install: less than an install waits, since an
+/// uninstaller is blocked meanwhile, and giving up is safe (the ref is dead once the app's files are
+/// gone, and the next gc frees its packs).
+pub const UNREF_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Drops an app's ref (its uninstaller calls this), then frees what no app uses. Waits up to
+/// [`UNREF_LOCK_WAIT`] for the store lock.
 pub fn unref(store: &Store, app_id: &str, on_wait: &mut dyn FnMut()) -> Result<(bool, GcReport)> {
-    let lock = store.lock(on_wait)?;
+    let lock = store.lock_within(UNREF_LOCK_WAIT, on_wait)?;
     let had = store.remove_ref(&lock, app_id)?;
     let gc = store.gc(&lock)?;
     Ok((had, gc))
