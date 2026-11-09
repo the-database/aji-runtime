@@ -14,7 +14,11 @@
 //! - A pack is deleted only when no live ref lists it. A ref is live if it parses and its
 //!   `app_path` exists; dead refs are removed by [`Store::gc`].
 //! - Everything that changes the store takes [`Store::lock`] first; the functions that change it
-//!   take the [`StoreLock`] as a parameter, so they can't be called without it.
+//!   take the [`StoreLock`] as a parameter, so they can't be called without it. A waiter gives up
+//!   after [`LOCK_WAIT`] with an error, never by breaking the lock.
+//! - Every change is a rename (a pack folder in or out whole, a ref or `aji-runtime.json` replaced
+//!   by [`write_atomic`]), so reading without the lock (`ensure --check`, `show`) sees each pack and
+//!   ref as it was before a change or after it, never half.
 //! - A pack is deleted by renaming it into `tmp/` first, so `packs/` only ever holds complete
 //!   packs. On Windows, a pack with a file in use (a loaded DLL) is skipped and retried by the
 //!   next gc, never half-deleted.
@@ -27,6 +31,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +39,23 @@ use crate::{Error, Result, err};
 
 /// The store format this version writes and fully understands.
 pub const FORMAT: u32 = 1;
+
+/// How long [`Store::lock`] waits for another app's install, update or move before giving up. Its
+/// downloads can't hang (`fetch`'s timeouts), so this is only for an install that takes this long
+/// (gigabytes on a slow connection) or a holder that hangs; giving up changes nothing.
+pub const LOCK_WAIT: Duration = Duration::from_secs(60 * 60);
+
+/// How often a waiting [`Store::lock`] tries again.
+const LOCK_POLL: Duration = Duration::from_millis(250);
+
+/// "5 minutes", "1 minute", or seconds below a minute (tests).
+pub fn minutes(d: Duration) -> String {
+    match d.as_secs() {
+        s if s < 60 => format!("{s} s"),
+        60..=119 => "1 minute".into(),
+        s => format!("{} minutes", s / 60),
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct StoreJson {
@@ -184,6 +206,17 @@ impl Store {
         Some(Store { root: root.to_path_buf(), format })
     }
 
+    /// The store at `root` for reading only (`ensure --check`): creates nothing, and a store that
+    /// isn't there yet reads as empty. An unreadable `store.json` is an error, as for [`Store::open`].
+    pub fn open_read_only(root: &Path) -> Result<Store> {
+        let sj = root.join("store.json");
+        let format = match fs::read(&sj) {
+            Ok(b) => serde_json::from_slice::<StoreJson>(&b).map_err(|e| err(format!("{}: {e}", sj.display())))?.format,
+            Err(_) => FORMAT,
+        };
+        Ok(Store { root: root.to_path_buf(), format })
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -209,9 +242,16 @@ impl Store {
         self.root.join("refs").join(format!("{app_id}.json"))
     }
 
-    /// Takes the store lock, waiting for another installer; `waiting` is called once first if it
-    /// has to wait.
+    /// Takes the store lock, waiting up to [`LOCK_WAIT`] for another installer; `waiting` is called
+    /// once first if it has to wait.
     pub fn lock(&self, waiting: &mut dyn FnMut()) -> Result<StoreLock> {
+        self.lock_within(LOCK_WAIT, waiting)
+    }
+
+    /// Takes the store lock, waiting up to `limit` for another installer; `waiting` is called once
+    /// first if it has to wait. Giving up is an error that changes nothing: the lock is only ever
+    /// taken, never broken (the OS releases it when its holder exits).
+    pub fn lock_within(&self, limit: Duration, waiting: &mut dyn FnMut()) -> Result<StoreLock> {
         let p = self.root.join("lock");
         let f = File::options()
             .read(true)
@@ -220,15 +260,28 @@ impl Store {
             .truncate(false)
             .open(&p)
             .map_err(|e| err(format!("{}: {e}", p.display())))?;
-        match f.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => {
-                waiting();
-                f.lock().map_err(|e| err(format!("{}: {e}", p.display())))?;
+        let start = Instant::now();
+        let mut said = false;
+        loop {
+            match f.try_lock() {
+                Ok(()) => return Ok(StoreLock { _file: f }),
+                Err(fs::TryLockError::WouldBlock) => {}
+                Err(fs::TryLockError::Error(e)) => return Err(err(format!("{}: {e}", p.display()))),
             }
-            Err(fs::TryLockError::Error(e)) => return Err(err(format!("{}: {e}", p.display()))),
+            let waited = start.elapsed();
+            if waited >= limit {
+                return Err(err(format!(
+                    "gave up waiting for the pack store after {}: another app's install or update has held it all that time ({}). Nothing was changed; try again once it has finished.",
+                    minutes(limit),
+                    p.display()
+                )));
+            }
+            if !said {
+                said = true;
+                waiting();
+            }
+            std::thread::sleep(LOCK_POLL.min(limit - waited));
         }
-        Ok(StoreLock { _file: f })
     }
 
     /// The lock if it's free right now, else None.

@@ -893,7 +893,8 @@ fn a_repacked_pack_with_the_same_files_is_installed() {
     let mut o = opts("app-b", &b, vec![rt1b.clone()], &empty);
     o.check = true;
     let (states, total, r) = plan_states(&f.store, &o);
-    assert!(r.unwrap().complete);
+    // nothing to install, but B has no ref yet: an ensure must still write it
+    assert!(!r.unwrap().complete);
     assert_eq!((states, total), (vec![PlanState::Installed], Some(0)));
     o.check = false;
     let (states, total, r) = plan_states(&f.store, &o);
@@ -1055,4 +1056,454 @@ fn a_pack_in_use_is_not_touched_by_a_newer_release() {
     assert!(r.gc.in_use.is_empty());
     assert!(dll.is_file());
     drop(held);
+}
+
+// ---- `ensure --check` and the app's ref (lib.rs `check`) ----
+// Updaters and AppImage launchers trust a complete check. A ref that names the app's old path (an
+// AppImage moved to ~/Applications) is dead: the next gc by any app frees the packs, and the app has
+// no TensorRT until something ensures again. So check is complete only when the ref is what an
+// ensure writes: there, listing exactly these packs, for this app_path.
+
+fn check_of(store: &Store, o: &EnsureOptions) -> EnsureResult {
+    run(store, &EnsureOptions { check: true, ..clone_opts(o) }).unwrap()
+}
+
+fn clone_opts(o: &EnsureOptions) -> EnsureOptions {
+    EnsureOptions {
+        app_id: o.app_id.clone(),
+        app_version: o.app_version.clone(),
+        app_path: o.app_path.clone(),
+        packs: o.packs.clone(),
+        mirror: o.mirror.clone(),
+        adopt_from: o.adopt_from.clone(),
+        aji_dir: o.aji_dir.clone(),
+        check: o.check,
+    }
+}
+
+#[test]
+fn check_is_complete_with_the_right_ref() {
+    let f = fixture("check-complete");
+    let a = app(&f.t, "a");
+    let o = opts("app-a", &a, vec![f.rt1.clone(), f.models.clone()], &f.mirror);
+    run(&f.store, &o).unwrap();
+    let r = check_of(&f.store, &o);
+    assert!(r.complete, "{:?}", r.stale);
+    assert!(r.stale.is_empty());
+    // the ref's order doesn't matter, only which packs
+    let reordered = opts("app-a", &a, vec![f.models.clone(), f.rt1.clone()], &f.mirror);
+    assert!(check_of(&f.store, &reordered).complete);
+}
+
+#[test]
+fn check_is_incomplete_without_a_ref() {
+    let f = fixture("check-no-ref");
+    let (a, b) = (app(&f.t, "a"), app(&f.t, "b"));
+    // the packs are there (another app installed them), but this app has no ref
+    run(&f.store, &opts("app-b", &b, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    let o = opts("app-a", &a, vec![f.rt1.clone()], &f.mirror);
+    let (states, total, r) = plan_states(&f.store, &EnsureOptions { check: true, ..clone_opts(&o) });
+    let r = r.unwrap();
+    assert_eq!((states, total), (vec![PlanState::Installed], Some(0)), "nothing to download");
+    assert!(!r.complete);
+    assert!(r.stale[0].contains("no ref"), "{:?}", r.stale);
+    // an unreadable ref is no ref
+    run(&f.store, &o).unwrap();
+    std::fs::write(f.store.root().join("refs").join("app-a.json"), b"{ not json").unwrap();
+    assert!(!check_of(&f.store, &o).complete);
+}
+
+#[test]
+fn check_is_incomplete_with_a_stale_ref() {
+    // the AppImage was moved: the ref names its old path, which is gone
+    let f = fixture("check-moved");
+    let (old, b) = (app(&f.t, "old"), app(&f.t, "b"));
+    run(&f.store, &opts("app-a", &old, vec![f.rt1.clone(), f.models.clone()], &f.mirror)).unwrap();
+    run(&f.store, &opts("app-b", &b, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    std::fs::remove_dir_all(old.parent().unwrap()).unwrap();
+    let new = app(&f.t, "Applications");
+    let o = opts("app-a", &new, vec![f.rt1.clone(), f.models.clone()], &f.mirror);
+    let r = check_of(&f.store, &o);
+    assert!(!r.complete);
+    assert_eq!(r.stale.len(), 1, "{:?}", r.stale);
+    assert!(r.stale[0].contains("another app path"), "{:?}", r.stale);
+    // what the check prevents: a gc now (app B's next ensure) frees A's models
+    assert!(!f.store.refs().iter().find(|e| e.app_ref.as_ref().is_some_and(|x| x.app_id == "app-a")).unwrap().live);
+    // the updater's ensure, run because the check was incomplete, writes the ref for the new path
+    // (nothing to download), and B's gc keeps everything
+    let r = run(&f.store, &EnsureOptions { mirror: None, ..clone_opts(&o) }).unwrap();
+    assert_eq!(r.downloaded_bytes, 0);
+    assert_eq!(f.store.read_ref("app-a").unwrap().app_path, new);
+    let r = run(&f.store, &opts("app-b", &b, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    assert!(r.gc.deleted.is_empty(), "{:?}", r.gc.deleted);
+    assert!(check_of(&f.store, &o).complete);
+}
+
+#[test]
+fn check_is_incomplete_when_the_ref_names_another_app_path() {
+    // both paths exist (two copies of the AppImage): the ref keeps the packs for the other one only
+    let f = fixture("check-other-path");
+    let (one, two) = (app(&f.t, "one"), app(&f.t, "two"));
+    run(&f.store, &opts("app-a", &one, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    let o = opts("app-a", &two, vec![f.rt1.clone()], &f.mirror);
+    let r = check_of(&f.store, &o);
+    assert!(!r.complete);
+    assert!(r.stale.iter().any(|s| s.contains("another app path")), "{:?}", r.stale);
+    run(&f.store, &o).unwrap();
+    assert_eq!(f.store.read_ref("app-a").unwrap().app_path, two);
+    assert!(check_of(&f.store, &o).complete);
+}
+
+#[cfg(windows)]
+#[test]
+fn check_compares_app_paths_case_insensitively_on_windows() {
+    let f = fixture("check-path-case");
+    let a = app(&f.t, "a");
+    run(&f.store, &opts("app-a", &a, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    let upper = PathBuf::from(a.to_string_lossy().to_uppercase().replace('\\', "/"));
+    assert!(check_of(&f.store, &opts("app-a", &upper, vec![f.rt1.clone()], &f.mirror)).complete);
+}
+
+#[test]
+fn check_is_incomplete_when_the_ref_lists_other_packs() {
+    let f = fixture("check-other-packs");
+    let (a, b) = (app(&f.t, "a"), app(&f.t, "b"));
+    run(&f.store, &opts("app-a", &a, vec![f.rt1.clone(), f.models.clone()], &f.mirror)).unwrap();
+    run(&f.store, &opts("app-b", &b, vec![f.sm120.clone()], &f.mirror)).unwrap();
+    // fewer packs (the models were dropped), more (a builder pack another app installed), others
+    for packs in [vec![f.rt1.clone()], vec![f.rt1.clone(), f.models.clone(), f.sm120.clone()], vec![f.sm120.clone()]] {
+        let o = opts("app-a", &a, packs, &f.mirror);
+        let r = check_of(&f.store, &o);
+        assert!(!r.complete);
+        assert!(r.stale.iter().any(|s| s.contains("other packs")), "{:?}", r.stale);
+    }
+    // and an ensure (non-check) writes the ref whole
+    let o = opts("app-a", &a, vec![f.rt1.clone(), f.sm120.clone()], &f.mirror);
+    run(&f.store, &o).unwrap();
+    let r = f.store.read_ref("app-a").unwrap();
+    assert_eq!(r.packs, vec!["trt-runtime/11.4", "trt-sm120/11.4"]);
+    assert_eq!(r.app_path, a);
+    assert!(check_of(&f.store, &o).complete);
+}
+
+#[test]
+fn check_is_incomplete_without_the_right_aji_runtime_json() {
+    let f = fixture("check-json");
+    let a = app(&f.t, "a");
+    let aji = f.t.path().join("apps/a/inference");
+    std::fs::create_dir_all(&aji).unwrap();
+    let mut o = opts("app-a", &a, vec![f.rt1.clone()], &f.mirror);
+    o.aji_dir = Some(aji.clone());
+    run(&f.store, &o).unwrap();
+    assert!(check_of(&f.store, &o).complete);
+    let json = aji.join("aji-runtime.json");
+    let good = std::fs::read(&json).unwrap();
+    std::fs::remove_file(&json).unwrap();
+    let r = check_of(&f.store, &o);
+    assert!(!r.complete);
+    assert!(r.stale[0].contains("aji-runtime.json"), "{:?}", r.stale);
+    // one naming another pack (an older version's)
+    std::fs::write(&json, String::from_utf8(good.clone()).unwrap().replace("11.4", "11.3")).unwrap();
+    assert!(!check_of(&f.store, &o).complete);
+    // the same content, formatted differently, is fine
+    let v: serde_json::Value = serde_json::from_slice(&good).unwrap();
+    std::fs::write(&json, serde_json::to_vec(&v).unwrap()).unwrap();
+    assert!(check_of(&f.store, &o).complete);
+}
+
+#[test]
+fn check_doesnt_wait_for_the_lock() {
+    let f = fixture("check-unlocked");
+    let a = app(&f.t, "a");
+    let o = opts("app-a", &a, vec![f.rt1.clone()], &f.mirror);
+    run(&f.store, &o).unwrap();
+    // another app is installing (it holds the lock, maybe for a long download)
+    let held = f.store.lock(&mut || {}).unwrap();
+    let start = std::time::Instant::now();
+    let mut waited = false;
+    let r = ensure(&f.store, &EnsureOptions { check: true, ..clone_opts(&o) }, &mut |e| {
+        if let Event::Waiting = e {
+            waited = true
+        }
+    })
+    .unwrap();
+    assert!(r.complete);
+    assert!(!waited);
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    // and it leaves the other installer's tmp/ alone
+    std::fs::write(f.store.tmp_dir().join("dl-other-download"), b"part").unwrap();
+    check_of(&f.store, &o);
+    assert!(f.store.tmp_dir().join("dl-other-download").exists());
+    drop(held);
+}
+
+#[test]
+fn check_of_a_store_not_there_yet_creates_nothing() {
+    let f = fixture("check-no-store");
+    let a = app(&f.t, "a");
+    let root = f.t.path().join("no-store-yet");
+    let store = Store::open_read_only(&root).unwrap();
+    let r = check_of(&store, &opts("app-a", &a, vec![f.rt1.clone()], &f.mirror));
+    assert!(!r.complete);
+    assert!(!root.exists());
+    // an unreadable store.json is an error, as for an install
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("store.json"), b"{").unwrap();
+    assert!(Store::open_read_only(&root).is_err());
+}
+
+// ---- the store lock's wait (store.rs `lock_within`) ----
+
+#[test]
+fn a_lock_wait_gives_up_without_breaking_the_lock() {
+    let f = fixture("lock-wait");
+    let a = app(&f.t, "a");
+    run(&f.store, &opts("app-a", &a, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    let held = f.store.lock(&mut || {}).unwrap();
+    let mut waits = 0;
+    let start = std::time::Instant::now();
+    let e = f.store.lock_within(std::time::Duration::from_millis(600), &mut || waits += 1).err().unwrap();
+    assert!(start.elapsed() >= std::time::Duration::from_millis(600));
+    assert_eq!(waits, 1, "the waiting note is said once");
+    assert!(e.0.contains("gave up waiting") && e.0.contains("Nothing was changed"), "{e}");
+    // still held by its owner, and the store is as it was
+    assert!(f.store.try_lock().unwrap().is_none());
+    assert_eq!(installed(&f.store), vec!["trt-runtime/11.4"]);
+    // once it's released within the limit, a waiter gets it
+    let root = f.store.root().to_path_buf();
+    let waiter = std::thread::spawn(move || {
+        let s = Store::open(&root).unwrap();
+        s.lock_within(std::time::Duration::from_secs(30), &mut || {}).map(|_| ()).is_ok()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    drop(held);
+    assert!(waiter.join().unwrap());
+}
+
+#[test]
+fn lock_wait_limits() {
+    assert_eq!(store::minutes(store::LOCK_WAIT), "60 minutes");
+    assert_eq!(store::minutes(UNREF_LOCK_WAIT), "5 minutes");
+    assert!(UNREF_LOCK_WAIT < store::LOCK_WAIT);
+}
+
+// ---- downloads: timeouts, retries and resume (fetch.rs) ----
+// A download runs under the store lock, so a stalled one blocked every other app's install and
+// uninstall for good. These run against a local server that misbehaves on purpose.
+
+#[derive(Clone, Copy, Debug)]
+enum Serve {
+    /// The whole body (or from the Range asked for).
+    Whole,
+    /// Headers with the full Content-Length, then this many bytes, then the connection is closed.
+    DropAfter(usize),
+    /// Headers, this many bytes, then nothing (the connection stays open).
+    StallAfter(usize),
+    /// The whole body with 200, whatever Range was asked for.
+    IgnoreRange,
+    Status(u16),
+}
+
+struct TestServer {
+    url: String,
+    /// The Range header of each request, in order.
+    ranges: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+}
+
+/// Serves `body` at /pack.zip; the n-th connection is answered as `script[n]` (the last entry for
+/// the rest).
+fn serve(body: Vec<u8>, script: Vec<Serve>) -> TestServer {
+    use std::io::Read as _;
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/pack.zip", l.local_addr().unwrap());
+    let ranges = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = ranges.clone();
+    let body = std::sync::Arc::new(body);
+    std::thread::spawn(move || {
+        for (i, conn) in l.incoming().enumerate() {
+            let Ok(mut s) = conn else { continue };
+            let how = *script.get(i).or(script.last()).unwrap();
+            let (body, seen) = (body.clone(), seen.clone());
+            std::thread::spawn(move || {
+                let mut req = Vec::new();
+                let mut b = [0u8; 1];
+                while !req.ends_with(b"\r\n\r\n") && s.read(&mut b).unwrap_or(0) == 1 {
+                    req.push(b[0]);
+                }
+                let req = String::from_utf8_lossy(&req).to_ascii_lowercase();
+                let range = req.lines().find_map(|l| l.strip_prefix("range: ")).map(|r| r.trim().to_string());
+                seen.lock().unwrap().push(range.clone());
+                let from = range
+                    .as_deref()
+                    .and_then(|r| r.strip_prefix("bytes="))
+                    .and_then(|r| r.strip_suffix('-'))
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .filter(|_| !matches!(how, Serve::IgnoreRange))
+                    .unwrap_or(0);
+                if let Serve::Status(c) = how {
+                    let _ = write!(s, "HTTP/1.1 {c} Nope\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    return;
+                }
+                let part = &body[from..];
+                let head = if from > 0 {
+                    format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {from}-{}/{}\r\n", body.len() - 1, body.len())
+                } else {
+                    "HTTP/1.1 200 OK\r\n".to_string()
+                };
+                let _ = write!(s, "{head}Content-Length: {}\r\nConnection: close\r\n\r\n", part.len());
+                match how {
+                    Serve::DropAfter(n) => {
+                        let _ = s.write_all(&part[..n.min(part.len())]);
+                    }
+                    Serve::StallAfter(n) => {
+                        let _ = s.write_all(&part[..n.min(part.len())]);
+                        let _ = s.flush();
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                    _ => {
+                        let _ = s.write_all(part);
+                    }
+                }
+            });
+        }
+    });
+    TestServer { url, ranges }
+}
+
+fn quick() -> fetch::Policy {
+    fetch::Policy {
+        connect: std::time::Duration::from_secs(5),
+        stall: std::time::Duration::from_millis(300),
+        retry_delays: vec![std::time::Duration::from_millis(20); 4],
+        max_attempts: 20,
+    }
+}
+
+fn test_body() -> Vec<u8> {
+    (0..200_000u32).map(|i| (i * 7 % 251) as u8).collect()
+}
+
+fn fetch_to(t: &Tmp, srv: &TestServer, expected: u64) -> (Result<()>, Vec<u8>, Vec<(u64, u64)>) {
+    let dest = t.path().join("download.part");
+    let mut events = Vec::new();
+    let r = fetch::download_with(&srv.url, &dest, expected, &quick(), &mut |got, total| events.push((got, total)));
+    (r, std::fs::read(&dest).unwrap_or_default(), events)
+}
+
+#[test]
+fn a_dropped_download_resumes_where_it_stopped() {
+    let t = Tmp::new("dl-drop");
+    let body = test_body();
+    let srv = serve(body.clone(), vec![Serve::DropAfter(70_000), Serve::Whole]);
+    let (r, got, events) = fetch_to(&t, &srv, body.len() as u64);
+    r.unwrap();
+    assert!(got == body, "the resumed file is the whole file");
+    assert_eq!(*srv.ranges.lock().unwrap(), vec![None, Some("bytes=70000-".to_string())]);
+    assert_eq!(events.last(), Some(&(body.len() as u64, body.len() as u64)));
+}
+
+#[test]
+fn a_stalled_download_times_out_and_resumes() {
+    let t = Tmp::new("dl-stall");
+    let body = test_body();
+    let srv = serve(body.clone(), vec![Serve::StallAfter(50_000), Serve::Whole]);
+    let start = std::time::Instant::now();
+    let (r, got, _) = fetch_to(&t, &srv, body.len() as u64);
+    r.unwrap();
+    assert!(got == body);
+    assert_eq!(*srv.ranges.lock().unwrap(), vec![None, Some("bytes=50000-".to_string())]);
+    assert!(start.elapsed() < std::time::Duration::from_secs(4), "it gave up on the stall, not the server");
+}
+
+#[test]
+fn a_slow_download_that_keeps_coming_doesnt_time_out() {
+    // a chunk every 200 ms for 2 s, under the 300 ms stall limit: no retry
+    let t = Tmp::new("dl-slow");
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/pack.zip", l.local_addr().unwrap());
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let (mut s, _) = l.accept().unwrap();
+        let mut b = [0u8; 4096];
+        let _ = s.read(&mut b);
+        let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n");
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = s.write_all(&[7u8; 1000]);
+            let _ = s.flush();
+        }
+    });
+    let dest = t.path().join("slow.part");
+    let p = fetch::Policy { retry_delays: Vec::new(), ..quick() };
+    fetch::download_with(&url, &dest, 10_000, &p, &mut |_, _| {}).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), vec![7u8; 10_000]);
+}
+
+#[test]
+fn a_server_without_ranges_starts_over() {
+    let t = Tmp::new("dl-norange");
+    let body = test_body();
+    let srv = serve(body.clone(), vec![Serve::DropAfter(70_000), Serve::IgnoreRange]);
+    let (r, got, _) = fetch_to(&t, &srv, body.len() as u64);
+    r.unwrap();
+    assert!(got == body, "not the first part twice");
+    assert_eq!(srv.ranges.lock().unwrap()[1], Some("bytes=70000-".to_string()));
+}
+
+#[test]
+fn a_download_that_never_comes_gives_up() {
+    let t = Tmp::new("dl-dead");
+    let srv = serve(test_body(), vec![Serve::StallAfter(0)]);
+    let start = std::time::Instant::now();
+    let (r, _, _) = fetch_to(&t, &srv, 200_000);
+    let e = r.err().unwrap();
+    assert!(e.0.contains("no data for") && e.0.contains("gave up after 5 attempts"), "{e}");
+    assert_eq!(srv.ranges.lock().unwrap().len(), 5);
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn a_download_making_progress_keeps_retrying() {
+    // dropped every 30 kB: more failures than the retries, but each gets further
+    let t = Tmp::new("dl-flaky");
+    let body = test_body();
+    let srv = serve(body.clone(), vec![Serve::DropAfter(30_000)]);
+    let (r, got, _) = fetch_to(&t, &srv, body.len() as u64);
+    r.unwrap();
+    assert!(got == body);
+    assert_eq!(srv.ranges.lock().unwrap().len(), 7);
+}
+
+#[test]
+fn missing_files_and_server_errors() {
+    let t = Tmp::new("dl-status");
+    // a 404 isn't retried
+    let srv = serve(test_body(), vec![Serve::Status(404)]);
+    let e = fetch_to(&t, &srv, 200_000).0.err().unwrap();
+    assert!(e.0.contains("404"), "{e}");
+    assert_eq!(srv.ranges.lock().unwrap().len(), 1);
+    // a 503 is, and so is the index fetch
+    let body = test_body();
+    let srv = serve(body.clone(), vec![Serve::Status(503), Serve::Whole]);
+    assert!(fetch_to(&t, &srv, body.len() as u64).1 == body);
+    let srv = serve(b"{\"index\": 1}".to_vec(), vec![Serve::Status(502), Serve::DropAfter(3), Serve::Whole]);
+    assert_eq!(fetch::fetch_small_with(&srv.url, &quick()).unwrap(), b"{\"index\": 1}");
+    assert_eq!(srv.ranges.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn ensure_installs_a_resumed_download() {
+    // the whole path: download (dropped once, resumed), SHA-256 check, extract, install
+    let f = fixture("ensure-resume");
+    let a = app(&f.t, "a");
+    let mut p = f.models.clone();
+    let archive = std::fs::read(f.mirror.join(&p.asset)).unwrap();
+    let srv = serve(archive.clone(), vec![Serve::DropAfter(archive.len() / 2), Serve::Whole]);
+    p.url = srv.url.clone();
+    let mut o = opts("app-a", &a, vec![p], &f.mirror);
+    o.mirror = None;
+    let r = run(&f.store, &o).unwrap();
+    assert_eq!(r.downloaded_bytes, archive.len() as u64);
+    assert_eq!(installed(&f.store), vec!["models-mangajanai/1.0.0"]);
+    assert_eq!(srv.ranges.lock().unwrap()[1], Some(format!("bytes={}-", archive.len() / 2)));
 }

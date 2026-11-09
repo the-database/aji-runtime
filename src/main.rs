@@ -154,7 +154,8 @@ fn ensure(a: &Args) -> Result<(), String> {
     }
     let want = if a.want.is_empty() { vec!["trt".to_string()] } else { a.want.clone() };
     let packs = index.select(&want, &gpus).map_err(|e| e.to_string())?;
-    let store = open_store(a)?;
+    // a check creates nothing (not even an empty store) and takes no lock
+    let store = if a.check { Store::open_read_only(&store_root(a)?).map_err(|e| e.to_string())? } else { open_store(a)? };
     eprintln!("Store: {}", store.root().display());
     let opts = EnsureOptions {
         app_id,
@@ -171,7 +172,7 @@ fn ensure(a: &Args) -> Result<(), String> {
     let mut shown = (String::new(), u64::MAX);
     let r = aji_runtime::ensure(&store, &opts, &mut |ev| match ev {
         Event::Waiting => {
-            eprintln!("Waiting for another installer to finish with the store...");
+            waiting_note(aji_runtime::store::LOCK_WAIT);
             say(lines, format_args!("AJI_WAIT"));
         }
         Event::Plan { pack, state } => {
@@ -211,6 +212,9 @@ fn ensure(a: &Args) -> Result<(), String> {
     })
     .map_err(|e| e.to_string())?;
     if a.check {
+        for s in &r.stale {
+            eprintln!("  out of date: {s}");
+        }
         eprintln!("{}", if r.complete { "Everything is installed." } else { "Not everything is installed." });
         if r.complete {
             say(lines, format_args!("AJI_DONE"));
@@ -222,6 +226,14 @@ fn ensure(a: &Args) -> Result<(), String> {
         eprintln!("Wrote {}", d.join("aji-runtime.json").display());
     }
     Ok(())
+}
+
+/// Said once when another app holds the store lock.
+fn waiting_note(limit: std::time::Duration) {
+    eprintln!(
+        "Waiting for another installer to finish with the store (giving up after {})...",
+        aji_runtime::store::minutes(limit)
+    );
 }
 
 fn report_gc(g: &aji_runtime::GcReport) {
@@ -296,8 +308,10 @@ fn path(a: &Args) -> Result<(), String> {
 }
 
 /// `show`: the app's ref as JSON on stdout, for an updater to read what this app has:
-/// `{"store", "format", "app_id", "has_ref", "app_version", "packs": [{"name", "version", "kind",
-/// "dir", "installed"}]}`. Changes nothing (a missing store reads as empty).
+/// `{"store", "format", "app_id", "has_ref", "app_version", "app_path", "packs": [{"name", "version",
+/// "kind", "dir", "installed"}]}`. `app_path` (null without a ref) is the path the ref keeps the packs
+/// for: a ref naming another path than the app's own (a moved AppImage) is dead once that path is
+/// gone, so the app ensures again. Changes nothing (a missing store reads as empty).
 fn show(a: &Args) -> Result<(), String> {
     let id = a.app_id.clone().ok_or("--app-id is required")?;
     aji_runtime::store::check_component("app id", &id).map_err(|e| e.to_string())?;
@@ -331,6 +345,7 @@ fn show(a: &Args) -> Result<(), String> {
         "app_id": id,
         "has_ref": r.is_some(),
         "app_version": r.as_ref().map(|r| r.app_version.clone()),
+        "app_path": r.as_ref().map(|r| r.app_path.to_string_lossy().into_owned()),
         "packs": packs,
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
@@ -374,7 +389,7 @@ fn move_store(a: &Args) -> Result<(), String> {
     let lines = a.lines;
     let mut waiting = || {
         say(lines, format_args!("AJI_WAIT"));
-        eprintln!("Waiting for another installer to finish with the store...");
+        waiting_note(aji_runtime::store::LOCK_WAIT);
     };
     let mut last = 0u64;
     let mut progress = |done: u64, total: u64| {
@@ -412,7 +427,7 @@ fn run() -> Result<(), String> {
         "unref" => {
             let id = a.app_id.clone().ok_or("--app-id is required")?;
             let store = open_store(&a)?;
-            let (had, gc) = aji_runtime::unref(&store, &id, &mut || eprintln!("Waiting for another installer to finish with the store..."))
+            let (had, gc) = aji_runtime::unref(&store, &id, &mut || waiting_note(aji_runtime::UNREF_LOCK_WAIT))
                 .map_err(|e| e.to_string())?;
             if !had {
                 eprintln!("{id} had no ref");
@@ -422,7 +437,7 @@ fn run() -> Result<(), String> {
         }
         "gc" => {
             let store = open_store(&a)?;
-            let lock = store.lock(&mut || eprintln!("Waiting for another installer to finish with the store...")).map_err(|e| e.to_string())?;
+            let lock = store.lock(&mut || waiting_note(aji_runtime::store::LOCK_WAIT)).map_err(|e| e.to_string())?;
             report_gc(&store.gc(&lock).map_err(|e| e.to_string())?);
             Ok(())
         }
