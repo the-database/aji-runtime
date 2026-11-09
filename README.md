@@ -54,6 +54,10 @@ aji-runtime reset
   - `--want trt` takes the TensorRT runtime plus a builder pack for each GPU generation found
     (falling back to PTX). `trtrtx` takes the TensorRT-RTX runtime; any other value is a pack
     name.
+  - A pack is installed when its folder's `.pack.json` lists the index's files (paths, sizes,
+    SHA-256s), whatever archive it came in, so a newer runtime release with the same files
+    downloads nothing. A pack folder is never replaced: an index with other files under an
+    installed name and version fails.
 - **`adopt`** first takes matching files from an app's old private install. They're found by
   SHA-256 and hard-linked, or copied across drives. The old install keeps working until the app
   deletes its copies.
