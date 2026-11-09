@@ -271,7 +271,7 @@ impl Store {
             let waited = start.elapsed();
             if waited >= limit {
                 return Err(err(format!(
-                    "gave up waiting for the pack store after {}: another app's install or update has held it                      all that time ({}). Nothing was changed; try again once it has finished.",
+                    "gave up waiting for the pack store after {}: another app's install or update has held it all that time ({}). Nothing was changed; try again once it has finished.",
                     minutes(limit),
                     p.display()
                 )));
