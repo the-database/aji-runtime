@@ -149,7 +149,8 @@ fn ensure(a: &Args) -> Result<(), String> {
     }
     let gpus = gpus(&a.gpus)?;
     for g in &gpus {
-        eprintln!("GPU: {} (compute {}.{})", g.name, g.major, g.minor);
+        let old = if g.trt_capable() { "" } else { "; too old for TensorRT, skipped" };
+        eprintln!("GPU: {} (compute {}.{}{old})", g.name, g.major, g.minor);
     }
     let want = if a.want.is_empty() { vec!["trt".to_string()] } else { a.want.clone() };
     let packs = index.select(&want, &gpus).map_err(|e| e.to_string())?;
