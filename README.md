@@ -52,7 +52,8 @@ aji-runtime reset
   - The index is the shared runtime release's `packs-<platform>.json` (animejanai-inference
     `scripts/runtime_packs.py`, tag `runtime-<n>`), pinned by SHA-256.
   - `--want trt` takes the TensorRT runtime plus a builder pack for each GPU generation found
-    (falling back to PTX). `trtrtx` takes the TensorRT-RTX runtime; any other value is a pack
+    (falling back to PTX). GPUs below compute capability 7.5 (older than the RTX 20 / GTX 16
+    series) are skipped, since TensorRT doesn't run on them; with only such GPUs it fails. `trtrtx` takes the TensorRT-RTX runtime; any other value is a pack
     name.
 - **`adopt`** first takes matching files from an app's old private install. They're found by
   SHA-256 and hard-linked, or copied across drives. The old install keeps working until the app

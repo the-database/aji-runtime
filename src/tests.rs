@@ -592,8 +592,8 @@ fn select_picks_builders_per_gpu_generation() {
     ]);
     let names = |v: Vec<IndexPack>| v.into_iter().map(|p| p.name).collect::<Vec<_>>();
     let want = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-    // two GPUs of one generation, one of another, one without its own pack (sm61 -> ptx)
-    let got = idx.select(&want(&["trt", "trtrtx", "models-mangajanai"]), &[gpu(12, 0), gpu(12, 0), gpu(8, 6), gpu(6, 1)]).unwrap();
+    // two GPUs of one generation, one of another, one without its own pack (sm130 -> ptx)
+    let got = idx.select(&want(&["trt", "trtrtx", "models-mangajanai"]), &[gpu(12, 0), gpu(12, 0), gpu(8, 6), gpu(13, 0)]).unwrap();
     assert_eq!(names(got), vec!["trt-runtime", "trt-sm120", "trt-sm86", "trt-ptx", "trtrtx-runtime", "models-mangajanai"]);
     assert!(idx.select(&want(&["trt"]), &[]).is_err(), "no GPU, no builder packs");
     assert!(idx.select(&want(&["dml-runtime"]), &[]).is_err(), "private packs aren't for the store");
@@ -778,4 +778,62 @@ fn a_store_in_use_doesnt_move() {
     drop(held);
     move_back(&root, &mut no_wait, &mut |_, _| {}).unwrap();
     assert_eq!(location(&root), Location::Default);
+}
+
+// ---- pre-Turing GPUs (compute capability below 7.5) -----------------------------------------
+// TensorRT doesn't run on them, and the PTX pack can't help (PTX only compiles forward).
+
+fn pre_turing_index() -> Index {
+    let pk = |name: &str, kind: &str, sm: Option<&str>| IndexPack {
+        name: name.into(),
+        version: "1".into(),
+        kind: kind.into(),
+        sm: sm.map(String::from),
+        asset: format!("{name}.7z"),
+        url: String::new(),
+        sha256: String::new(),
+        bytes: 1,
+        installed_bytes: 1,
+        files: vec![],
+    };
+    index_with(vec![
+        pk("trt-runtime", "trt", None),
+        pk("trt-sm75", "trt-builder", Some("sm75")),
+        pk("trt-sm86", "trt-builder", Some("sm86")),
+        pk("trt-ptx", "trt-builder", Some("ptx")),
+        pk("models-mangajanai", "models", None),
+    ])
+}
+
+#[test]
+fn trt_threshold_is_turing() {
+    assert_eq!(crate::nvml::TRT_MIN_COMPUTE, (7, 5));
+    for (major, minor) in [(5, 2), (6, 1), (7, 0), (7, 2)] {
+        assert!(!gpu(major, minor).trt_capable(), "sm{major}{minor}");
+    }
+    for (major, minor) in [(7, 5), (8, 0), (8, 6), (12, 0), (13, 0)] {
+        assert!(gpu(major, minor).trt_capable(), "sm{major}{minor}");
+    }
+}
+
+#[test]
+fn select_skips_pre_turing_gpus() {
+    let idx = pre_turing_index();
+    let names = |v: Vec<IndexPack>| v.into_iter().map(|p| p.name).collect::<Vec<_>>();
+    let want = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    // a GTX 1080 (sm61) next to an RTX 3080 (sm86): only the 3080's pack, no PTX for the 1080
+    let got = idx.select(&want(&["trt"]), &[gpu(6, 1), gpu(8, 6)]).unwrap();
+    assert_eq!(names(got), vec!["trt-runtime", "trt-sm86"]);
+    // Volta (sm70) next to Turing (sm75)
+    let got = idx.select(&want(&["trt"]), &[gpu(7, 0), gpu(7, 5)]).unwrap();
+    assert_eq!(names(got), vec!["trt-runtime", "trt-sm75"]);
+    // only old GPUs: TensorRT can't run, and the error says why
+    for gpus in [vec![gpu(6, 1)], vec![gpu(6, 1), gpu(7, 0)]] {
+        let e = idx.select(&want(&["trt"]), &gpus).unwrap_err().to_string();
+        assert!(e.contains("TensorRT needs an NVIDIA GeForce RTX 20 / GTX 16 series or newer GPU (compute capability 7.5+)"), "{e}");
+        assert!(e.contains("sm61 is compute 6.1"), "{e}");
+    }
+    // packs other than trt don't depend on the GPU
+    let got = idx.select(&want(&["models-mangajanai"]), &[gpu(6, 1)]).unwrap();
+    assert_eq!(names(got), vec!["models-mangajanai"]);
 }

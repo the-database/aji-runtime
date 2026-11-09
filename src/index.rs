@@ -90,7 +90,8 @@ impl Index {
 
     /// The store packs for `wants`, in install order, without duplicates:
     /// - `trt`: the TensorRT runtime and the builder resources for each GPU generation in `gpus`
-    ///   (its own pack, else the PTX fallback);
+    ///   (its own pack, else the PTX fallback). GPUs below [`crate::nvml::TRT_MIN_COMPUTE`] are
+    ///   left out, and an error if no other GPU is there;
     /// - `trtrtx`: the TensorRT-RTX runtime;
     /// - anything else: the pack of that name (models-..., or a builder pack by name).
     pub fn select(&self, wants: &[String], gpus: &[Gpu]) -> Result<Vec<IndexPack>> {
@@ -114,7 +115,12 @@ impl Index {
                     if gpus.is_empty() {
                         return Err(err("no NVIDIA GPU found for the TensorRT builder packs"));
                     }
-                    for g in gpus {
+                    // GPUs older than TensorRT supports get no builder pack (not the PTX one,
+                    // which only compiles forward); with no other GPU there's nothing to install.
+                    if !gpus.iter().any(Gpu::trt_capable) {
+                        return Err(err(crate::nvml::too_old_message(gpus)));
+                    }
+                    for g in gpus.iter().filter(|g| g.trt_capable()) {
                         let sm = g.sm();
                         let builders = || self.packs.iter().filter(|p| p.kind == "trt-builder");
                         let b = builders()
