@@ -1507,3 +1507,835 @@ fn ensure_installs_a_resumed_download() {
     assert_eq!(installed(&f.store), vec!["models-mangajanai/1.0.0"]);
     assert_eq!(srv.ranges.lock().unwrap()[1], Some(format!("bytes={}-", archive.len() / 2)));
 }
+
+// ---- the settings file (settings.rs) ----
+// Edited by hand by people who aren't programmers: forgiving where it can be, and an error that
+// says where when it can't.
+
+use crate::settings::{self as conf, Source, resolve_with};
+
+fn parse_conf(text: &str) -> Result<conf::Settings> {
+    conf::parse(text, Path::new("C:/App/aji-runtime.conf"))
+}
+
+#[test]
+fn settings_parse_forgivingly() {
+    let s = |t: &str| parse_conf(t).unwrap().store;
+    assert_eq!(s(""), None);
+    assert_eq!(s("store = runtime"), Some("runtime".into()));
+    assert_eq!(s("  store=runtime  \r\n"), Some("runtime".into()));
+    assert_eq!(s("\u{feff}store = runtime\n"), Some("runtime".into()), "a BOM");
+    assert_eq!(s("# a comment\n; another\n\n   # indented\nstore = D:\\aji\n"), Some("D:\\aji".into()));
+    assert_eq!(s("store = \"C:\\My Apps\\runtime\""), Some("C:\\My Apps\\runtime".into()), "Copy as path");
+    assert_eq!(s("store = \"\"x\"\""), Some("\"x\"".into()), "one pair of quotes only");
+    assert_eq!(s("store = \"half"), Some("\"half".into()));
+    assert_eq!(s("store = a=b"), Some("a=b".into()), "the value is taken as typed");
+    assert_eq!(s("store = C:\\tmp\\new"), Some("C:\\tmp\\new".into()), "no escapes");
+    assert_eq!(s("store ="), None, "empty: the per-user store");
+    assert_eq!(s("store = \"\""), None);
+    assert_eq!(s("Store = x"), Some("x".into()));
+    assert_eq!(s("store = a\nstore = b"), Some("b".into()), "the last one counts");
+}
+
+#[test]
+fn settings_errors_name_the_file_and_line() {
+    let e = parse_conf("# mine\n\nstor = runtime\n").unwrap_err().to_string();
+    assert!(e.contains("aji-runtime.conf line 3: unknown setting \"stor\" (did you mean \"store\"?)"), "{e}");
+    let e = parse_conf("store = x\nrunt1me\n").unwrap_err().to_string();
+    assert!(e.contains("aji-runtime.conf line 2") && e.contains("store = <folder>"), "{e}");
+    // a missing file is the default; a file that isn't text is an error
+    let t = Tmp::new("conf-read");
+    assert_eq!(conf::read(&t.path().join("none.conf")).unwrap(), conf::Settings::default());
+    std::fs::write(t.path().join("bad.conf"), [0xff, 0xfe, 0x00]).unwrap();
+    assert!(conf::read(&t.path().join("bad.conf")).is_err());
+}
+
+#[test]
+fn written_settings_read_back() {
+    let t = Tmp::new("conf-write");
+    let f = t.path().join("aji-runtime.conf");
+    for v in ["runtime", "..\\shared runtime", "D:\\aji", " padded ", ""] {
+        conf::write(&f, v).unwrap();
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert!(text.lines().filter(|l| l.starts_with('#')).count() >= 2, "a commented file");
+        assert_eq!(conf::read(&f).unwrap().store, (!v.is_empty()).then(|| v.to_string()), "{text}");
+    }
+    assert!(std::fs::read_to_string(&f).unwrap().contains("\nstore = \n"), "--shared keeps the file with `store =`");
+}
+
+#[test]
+fn the_store_comes_from_flag_env_settings_default_in_that_order() {
+    let t = Tmp::new("resolve");
+    let app = t.path().join("App");
+    std::fs::create_dir_all(&app).unwrap();
+    let file = app.join("aji-runtime.conf");
+    let user = t.path().join("user-store");
+    let (flag, env) = (t.path().join("flag"), t.path().join("env"));
+    let r = resolve_with(None, None, &file, &user).unwrap();
+    assert_eq!((r.source, &r.root, r.relative, &r.setting), (Source::Default, &user, false, &None), "no file");
+    conf::write(&file, "").unwrap();
+    assert_eq!(resolve_with(None, None, &file, &user).unwrap().source, Source::Default, "an empty setting");
+    conf::write(&file, "runtime").unwrap();
+    let r = resolve_with(None, None, &file, &user).unwrap();
+    assert_eq!((r.source, r.relative), (Source::Settings, true));
+    assert_eq!(r.root, paths::absolute(&app.join("runtime")), "relative to the settings file's folder");
+    conf::write(&file, &Path::new("..").join("beside").to_string_lossy()).unwrap();
+    assert_eq!(resolve_with(None, None, &file, &user).unwrap().root, paths::absolute(&t.path().join("beside")));
+    let abs = t.path().join("custom");
+    conf::write(&file, &abs.to_string_lossy()).unwrap();
+    let r = resolve_with(None, None, &file, &user).unwrap();
+    assert_eq!((r.source, r.relative, r.root.clone()), (Source::Settings, false, abs.clone()));
+    let r = resolve_with(None, Some(env.clone().into()), &file, &user).unwrap();
+    assert_eq!((r.source, &r.root, r.relative), (Source::Env, &env, false));
+    assert_eq!(r.setting.as_deref(), Some(abs.to_string_lossy().as_ref()), "the setting is still reported");
+    let r = resolve_with(Some(&flag), Some(env.into()), &file, &user).unwrap();
+    assert_eq!((r.source, &r.root), (Source::Flag, &flag));
+    assert_eq!(resolve_with(None, Some("".into()), &file, &user).unwrap().source, Source::Settings, "an empty env is unset");
+    // a broken settings file stops only what it decides
+    std::fs::write(&file, "stor = x\n").unwrap();
+    assert!(resolve_with(None, None, &file, &user).unwrap_err().to_string().contains("line 1"));
+    assert_eq!(resolve_with(Some(&flag), None, &file, &user).unwrap().source, Source::Flag);
+}
+
+#[test]
+fn location_json_says_where_the_store_comes_from() {
+    let t = Tmp::new("location-json");
+    let app = t.path().join("App");
+    std::fs::create_dir_all(&app).unwrap();
+    let file = app.join("aji-runtime.conf");
+    let user = t.path().join("user-store");
+    conf::write(&file, "runtime").unwrap();
+    let r = resolve_with(None, None, &file, &user).unwrap();
+    let j = r.location_json();
+    assert_eq!(j["root"], paths::absolute(&app.join("runtime")).to_string_lossy().as_ref());
+    assert_eq!((j["moved"].clone(), j["target"].clone()), (false.into(), serde_json::Value::Null));
+    assert_eq!(j["available"], true, "not there yet, on a drive that is: created by the first install");
+    assert_eq!((j["source"].as_str(), j["setting"].as_str(), j["relative"].as_bool()), (Some("settings"), Some("runtime"), Some(true)));
+    assert_eq!(j["settings_file"], file.to_string_lossy().as_ref());
+    assert_eq!(j["default_root"], user.to_string_lossy().as_ref());
+    let keys: Vec<&String> = j.as_object().unwrap().keys().collect();
+    assert_eq!(keys.len(), 9, "{keys:?}");
+    let j = resolve_with(None, None, &app.join("none.conf"), &user).unwrap().location_json();
+    assert_eq!((j["source"].as_str(), j["setting"].clone(), j["relative"].as_bool()), (Some("default"), serde_json::Value::Null, Some(false)));
+    assert_eq!(j["available"], true);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_store_on_an_unplugged_drive_is_unavailable() {
+    let t = Tmp::new("location-drive");
+    let free = (b'D'..=b'Z').rev().map(|c| format!("{}:\\", c as char)).find(|d| !Path::new(d).exists()).unwrap();
+    let file = t.path().join("aji-runtime.conf");
+    conf::write(&file, &format!("{free}aji")).unwrap();
+    let r = resolve_with(None, None, &file, &t.path().join("user")).unwrap();
+    assert_eq!(r.location_json()["available"], false);
+    assert!(r.open().is_err(), "and nothing is started elsewhere");
+}
+
+#[test]
+fn move_and_reset_are_refused_for_a_store_set_in_the_settings_file() {
+    let t = Tmp::new("move-settings");
+    let file = t.path().join("aji-runtime.conf");
+    let user = t.path().join("user-store");
+    conf::write(&file, "runtime").unwrap();
+    let e = resolve_with(None, None, &file, &user).unwrap().check_movable().unwrap_err().to_string();
+    assert!(e.contains("this copy keeps its runtime in") && e.contains("aji-runtime.conf") && e.contains("aji-runtime use"), "{e}");
+    for (flag, env) in [(Some(t.path().join("f")), None), (None, Some(t.path().join("e").into_os_string()))] {
+        assert!(resolve_with(flag.as_deref(), env, &file, &user).unwrap().check_movable().is_ok());
+    }
+    assert!(resolve_with(None, None, &t.path().join("none.conf"), &user).unwrap().check_movable().is_ok());
+}
+
+// ---- relative mode: the store inside or beside the app's folder ----
+// The point: the whole folder can be moved or copied to another PC and keep working. The rules that
+// must hold everywhere: a relative app_path is resolved against the store root, by every store.
+
+/// An app folder with a settings file, its exe and libaji folder, and the per-user store beside.
+struct Portable {
+    f: Fixture,
+    app_dir: PathBuf,
+    exe: PathBuf,
+    aji: PathBuf,
+    conf: PathBuf,
+    user: PathBuf,
+}
+
+fn portable(name: &str) -> Portable {
+    let f = fixture(name);
+    let app_dir = f.t.path().join("Portable").join("VideoJaNai");
+    std::fs::create_dir_all(app_dir.join("inference")).unwrap();
+    let exe = app_dir.join("VideoJaNai.exe");
+    std::fs::write(&exe, b"exe").unwrap();
+    let user = f.store.root().to_path_buf();
+    Portable { aji: app_dir.join("inference"), conf: app_dir.join("aji-runtime.conf"), app_dir, exe, user, f }
+}
+
+impl Portable {
+    fn resolved(&self) -> conf::Resolved {
+        resolve_with(None, None, &self.conf, &self.user).unwrap()
+    }
+    fn opts(&self, packs: Vec<IndexPack>) -> EnsureOptions {
+        let mut o = opts("videojanai", &self.exe, packs, &self.f.mirror);
+        o.aji_dir = Some(self.aji.clone());
+        o
+    }
+}
+
+fn json_of(dir: &Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(dir.join("aji-runtime.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn relative_mode_writes_relative_paths() {
+    let p = portable("rel-write");
+    conf::write(&p.conf, "runtime").unwrap();
+    let store = p.resolved().open().unwrap();
+    assert!(store.is_relative());
+    run(&store, &p.opts(vec![p.f.rt1.clone(), p.f.models.clone()])).unwrap();
+    let r = store.read_ref("videojanai").unwrap();
+    assert_eq!(r.app_path, PathBuf::from("..").join("VideoJaNai.exe"));
+    assert!(store.refs()[0].live);
+    let j = json_of(&p.aji);
+    let trt = PathBuf::from("..").join("runtime").join("packs").join("trt-runtime").join("11.4");
+    assert_eq!(j["trt"], trt.to_string_lossy().as_ref(), "native separators, relative to the json's folder");
+    assert!(p.aji.join(j["models"][0].as_str().unwrap()).join("a.onnx").is_file());
+    assert!(check_of(&store, &p.opts(vec![p.f.rt1.clone(), p.f.models.clone()])).complete);
+    // outside relative mode: absolute, as before
+    let abs = Store::open(store.root()).unwrap();
+    run(&abs, &p.opts(vec![p.f.rt1.clone()])).unwrap();
+    assert_eq!(abs.read_ref("videojanai").unwrap().app_path, p.exe);
+    assert_eq!(json_of(&p.aji)["trt"], abs.pack_dir("trt-runtime", "11.4").to_string_lossy().as_ref());
+}
+
+#[test]
+fn a_relative_ref_keeps_its_packs_after_the_whole_tree_moves() {
+    let p = portable("rel-move");
+    conf::write(&p.conf, "runtime").unwrap();
+    let o = p.opts(vec![p.f.rt1.clone(), p.f.models.clone()]);
+    run(&p.resolved().open().unwrap(), &o).unwrap();
+    // the whole folder moved (or copied to another PC)
+    let moved = p.f.t.path().join("Elsewhere").join("VJ");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&p.app_dir, &moved).unwrap();
+    let res = resolve_with(None, None, &moved.join("aji-runtime.conf"), &p.user).unwrap();
+    let store = res.open().unwrap();
+    // gc in that store, opened in any mode, keeps everything
+    for s in [Store::open(store.root()).unwrap(), Store::open(store.root()).unwrap().with_relative(true)] {
+        let lock = s.lock(&mut || {}).unwrap();
+        let gc = s.gc(&lock).unwrap();
+        assert!(gc.deleted.is_empty() && gc.dead_refs.is_empty(), "{gc:?}");
+    }
+    assert_eq!(installed(&store), vec!["models-mangajanai/1.0.0", "trt-runtime/11.4"]);
+    // and nothing needs fixing: the check is complete (ref and aji-runtime.json still right)
+    let mut o2 = opts("videojanai", &moved.join("VideoJaNai.exe"), o.packs.clone(), &p.f.t.path().join("no-mirror"));
+    o2.aji_dir = Some(moved.join("inference"));
+    let r = check_of(&store, &o2);
+    assert!(r.complete, "{:?}", r.stale);
+    assert!(moved.join("inference").join(json_of(&moved.join("inference"))["trt"].as_str().unwrap()).join("nvinfer_11.dll").is_file());
+}
+
+#[test]
+fn a_relative_ref_whose_exe_is_gone_is_dead() {
+    let p = portable("rel-dead");
+    conf::write(&p.conf, "runtime").unwrap();
+    let store = p.resolved().open().unwrap();
+    run(&store, &p.opts(vec![p.f.rt1.clone()])).unwrap();
+    std::fs::remove_file(&p.exe).unwrap();
+    // even a store opened without relative mode resolves it against its root
+    let plain = Store::open(store.root()).unwrap();
+    assert!(!plain.refs()[0].live);
+    let lock = plain.lock(&mut || {}).unwrap();
+    let gc = plain.gc(&lock).unwrap();
+    assert_eq!((gc.deleted.clone(), gc.dead_refs.len()), (vec!["trt-runtime/11.4".to_string()], 1));
+}
+
+#[test]
+fn a_relative_ref_is_live_against_the_store_root_not_the_current_folder() {
+    // a ref with a relative path that only exists relative to the current folder is dead
+    let f = fixture("rel-cwd");
+    let lock = f.store.lock(&mut || {}).unwrap();
+    let cwd_file = PathBuf::from("Cargo.toml");
+    assert!(cwd_file.exists());
+    let r = AppRef { app_id: "x".into(), app_version: String::new(), app_path: cwd_file, packs: vec![] };
+    f.store.write_ref(&lock, &r).unwrap();
+    assert!(!f.store.refs()[0].live);
+}
+
+#[test]
+fn check_wants_the_form_this_mode_writes() {
+    let p = portable("rel-form");
+    conf::write(&p.conf, "runtime").unwrap();
+    let rel = p.resolved().open().unwrap();
+    let abs = Store::open(rel.root()).unwrap();
+    let o = opts("videojanai", &p.exe, vec![p.f.rt1.clone()], &p.f.mirror);
+    // an absolute ref for the same exe: an ensure in relative mode would rewrite it
+    run(&abs, &o).unwrap();
+    assert!(check_of(&abs, &o).complete);
+    let r = check_of(&rel, &o);
+    assert!(!r.complete && r.stale[0].contains("another app path"), "{:?}", r.stale);
+    run(&rel, &o).unwrap();
+    assert!(check_of(&rel, &o).complete);
+    assert!(!check_of(&abs, &o).complete, "and the other way round");
+    // a relative aji-runtime.json is stale outside relative mode, and an absolute one inside it
+    let mut o = p.opts(vec![p.f.rt1.clone()]);
+    run(&rel, &o).unwrap();
+    assert!(check_of(&rel, &o).complete);
+    o.app_path = p.exe.clone();
+    let mut a = clone_opts(&o);
+    a.check = true;
+    assert!(run(&abs, &a).unwrap().stale.iter().any(|s| s.contains("aji-runtime.json")));
+}
+
+#[test]
+fn a_store_on_another_drive_gets_absolute_paths_in_relative_mode() {
+    assert_eq!(paths::relative_to(Path::new("/a/b"), Path::new("/a/c/d")), Some(PathBuf::from("..").join("c").join("d")));
+    assert_eq!(paths::relative_to(Path::new("/a/b"), Path::new("/a/b")), Some(PathBuf::from(".")));
+    #[cfg(windows)]
+    {
+        assert_eq!(paths::relative_to(Path::new("C:\\a"), Path::new("D:\\a\\x.exe")), None);
+        assert_eq!(paths::relative_to(Path::new("C:\\Apps\\VJ"), Path::new("c:\\apps\\vj\\x.exe")), Some(PathBuf::from("x.exe")));
+        let s = Store::open_read_only(Path::new("C:\\nowhere\\store")).unwrap().with_relative(true);
+        assert_eq!(s.path_form(Path::new("D:\\VJ\\x.exe")), PathBuf::from("D:\\VJ\\x.exe"));
+        assert_eq!(s.path_form(Path::new("C:\\nowhere\\x.exe")), PathBuf::from("..\\x.exe"));
+    }
+}
+
+// ---- per-copy refs (two copies of one app on one PC) ----
+
+#[test]
+fn per_copy_ids_differ_per_path() {
+    let f = fixture("per-copy-ids");
+    let (one, two) = (app(&f.t, "one"), app(&f.t, "two"));
+    let a = copy_ref_id(&f.store, "videojanai", &one).unwrap();
+    let b = copy_ref_id(&f.store, "videojanai", &two).unwrap();
+    assert_ne!(a, b);
+    assert!(a.starts_with("videojanai-") && a.len() == "videojanai-".len() + 8, "{a}");
+    assert!(a["videojanai-".len()..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    // normalized: separators, `.`, a trailing separator (and case on Windows) don't matter
+    let messy = PathBuf::from(format!("{}/./app.exe", one.parent().unwrap().display()));
+    assert_eq!(copy_ref_id(&f.store, "videojanai", &messy).unwrap(), a);
+    #[cfg(windows)]
+    assert_eq!(copy_ref_id(&f.store, "videojanai", &PathBuf::from(one.to_string_lossy().to_uppercase())).unwrap(), a);
+    // the id is the hash of the path as the ref stores it
+    let key = paths::path_key(&one);
+    assert_eq!(a, format!("videojanai-{}", &sha256_bytes(key.as_bytes())[..8]));
+    // both copies install side by side; neither's ref is the other's
+    run(&f.store, &opts("videojanai", &one, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    let mut seen = Vec::new();
+    for exe in [&one, &two] {
+        let r = ensure_per_copy(&f.store, &opts("videojanai", exe, vec![f.rt1.clone()], &f.mirror), &mut |_| {}).unwrap();
+        assert!(r.complete);
+        seen.push(copy_ref_id(&f.store, "videojanai", exe).unwrap());
+    }
+    for (id, exe) in seen.iter().zip([&one, &two]) {
+        assert_eq!(&f.store.read_ref(id).unwrap().app_path, exe);
+        assert_eq!(&f.store.read_ref(id).unwrap().app_id, id);
+    }
+}
+
+#[test]
+fn per_copy_ids_survive_moving_the_tree_in_relative_mode() {
+    let p = portable("per-copy-move");
+    conf::write(&p.conf, "runtime").unwrap();
+    let store = p.resolved().open().unwrap();
+    let id = copy_ref_id(&store, "videojanai", &p.exe).unwrap();
+    ensure_per_copy(&store, &p.opts(vec![p.f.rt1.clone()]), &mut |_| {}).unwrap();
+    let moved = p.f.t.path().join("USB").join("VJ");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&p.app_dir, &moved).unwrap();
+    let store = resolve_with(None, None, &moved.join("aji-runtime.conf"), &p.user).unwrap().open().unwrap();
+    let exe = moved.join("VideoJaNai.exe");
+    assert_eq!(copy_ref_id(&store, "videojanai", &exe).unwrap(), id);
+    let mut o = opts("videojanai", &exe, vec![p.f.rt1.clone()], &p.f.t.path().join("no-mirror"));
+    o.aji_dir = Some(moved.join("inference"));
+    o.check = true;
+    assert!(ensure_per_copy(&store, &o, &mut |_| {}).unwrap().complete);
+    // outside relative mode the id is of the absolute path, which a move changes
+    let abs = Store::open(store.root()).unwrap();
+    assert_ne!(copy_ref_id(&abs, "videojanai", &exe).unwrap(), copy_ref_id(&abs, "videojanai", &p.exe).unwrap());
+}
+
+#[test]
+fn per_copy_takes_over_the_plain_ref_only_for_the_same_path() {
+    let f = fixture("per-copy-migrate");
+    let (one, two) = (app(&f.t, "one"), app(&f.t, "two"));
+    let o1 = opts("videojanai", &one, vec![f.rt1.clone(), f.models.clone()], &f.mirror);
+    // the plain ref, made before the app used per-copy refs, for copy one
+    run(&f.store, &o1).unwrap();
+    // copy one finds it (show, path, use); copy two doesn't
+    let (rid, r) = find_ref(&f.store, "videojanai", Some(&one), true).unwrap().unwrap();
+    assert_eq!((rid.as_str(), &r.app_path), ("videojanai", &one));
+    assert!(find_ref(&f.store, "videojanai", Some(&two), true).unwrap().is_none());
+    assert!(find_ref(&f.store, "videojanai", None, true).is_err(), "--per-copy needs --app-path");
+    // a check with --per-copy is incomplete while the plain ref is there
+    let r = run(&f.store, &EnsureOptions { check: true, ..clone_opts(&o1) }).unwrap();
+    assert!(r.complete, "the plain check is fine");
+    let r = ensure_per_copy(&f.store, &EnsureOptions { check: true, ..clone_opts(&o1) }, &mut |_| {}).unwrap();
+    assert!(!r.complete && r.stale.iter().any(|s| s.contains("plain ref")), "{:?}", r.stale);
+    // copy two's per-copy ensure leaves copy one's plain ref alone
+    let o2 = opts("videojanai", &two, vec![f.rt1.clone()], &f.mirror);
+    ensure_per_copy(&f.store, &o2, &mut |_| {}).unwrap();
+    assert_eq!(f.store.read_ref("videojanai").unwrap().app_path, one);
+    assert!(f.store.installed("models-mangajanai", "1.0.0").is_some(), "copy one's packs are kept");
+    // copy one's per-copy ensure replaces it: no plain ref, nothing freed
+    let r = ensure_per_copy(&f.store, &o1, &mut |_| {}).unwrap();
+    assert!(r.gc.deleted.is_empty(), "{:?}", r.gc.deleted);
+    assert!(f.store.read_ref("videojanai").is_none());
+    let id1 = copy_ref_id(&f.store, "videojanai", &one).unwrap();
+    assert_eq!(f.store.read_ref(&id1).unwrap().packs, vec!["trt-runtime/11.4", "models-mangajanai/1.0.0"]);
+    assert!(ensure_per_copy(&f.store, &EnsureOptions { check: true, ..clone_opts(&o1) }, &mut |_| {}).unwrap().complete);
+    assert_eq!(find_ref(&f.store, "videojanai", Some(&one), true).unwrap().unwrap().0, id1);
+}
+
+#[test]
+fn unref_per_copy_drops_the_plain_ref_only_for_the_same_path() {
+    let f = fixture("per-copy-unref");
+    let (one, two) = (app(&f.t, "one"), app(&f.t, "two"));
+    // copy two has a per-copy ref; the plain ref is copy one's
+    run(&f.store, &opts("videojanai", &one, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    ensure_per_copy(&f.store, &opts("videojanai", &two, vec![f.models.clone()], &f.mirror), &mut |_| {}).unwrap();
+    let (had, gc) = unref_per_copy(&f.store, "videojanai", &two, &mut || {}).unwrap();
+    assert!(had);
+    assert_eq!(gc.deleted, vec!["models-mangajanai/1.0.0".to_string()]);
+    assert_eq!(f.store.read_ref("videojanai").unwrap().app_path, one, "another path's plain ref is never touched");
+    // copy one, uninstalled (its exe already gone) by an uninstaller that passes --per-copy
+    std::fs::remove_file(&one).unwrap();
+    let (had, gc) = unref_per_copy(&f.store, "videojanai", &one, &mut || {}).unwrap();
+    assert!(had);
+    assert_eq!(gc.deleted, vec!["trt-runtime/11.4".to_string()]);
+    assert!(f.store.refs().is_empty());
+}
+
+// ---- taking packs from the per-user store instead of downloading ----
+
+/// Every file under `dir` with its bytes, to see that a store wasn't changed.
+fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files = Vec::new();
+    crate::list_files(dir, dir, &mut files);
+    files.sort();
+    files.into_iter().filter(|f| f != "lock").map(|f| (f.clone(), std::fs::read(dir.join(&f)).unwrap())).collect()
+}
+
+#[test]
+fn a_custom_store_takes_packs_from_the_per_user_store() {
+    let p = portable("take-shared");
+    let other = app(&p.f.t, "other");
+    run(&p.f.store, &opts("other-app", &other, vec![p.f.rt1.clone(), p.f.models.clone()], &p.f.mirror)).unwrap();
+    let before = snapshot(&p.user);
+    conf::write(&p.conf, "runtime").unwrap();
+    let store = p.resolved().open().unwrap();
+    assert_eq!(store.shared_root(), Some(p.user.as_path()));
+    // nothing to download (an empty mirror): the runtime comes from the per-user store
+    let empty = p.f.t.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let mut o = opts("videojanai", &p.exe, vec![p.f.rt1.clone(), p.f.sm120.clone()], &empty);
+    o.check = true;
+    let (states, total, r) = plan_states(&store, &o);
+    assert_eq!((states, total), (vec![PlanState::Adopted, PlanState::Download], Some(p.f.sm120.bytes)));
+    assert!(!r.unwrap().complete);
+    o.check = false;
+    o.packs = vec![p.f.rt1.clone()];
+    let (states, total, r) = plan_states(&store, &o);
+    let r = r.unwrap();
+    assert_eq!((states, total, r.adopted), (vec![PlanState::Adopted], Some(0), vec!["trt-runtime/11.4".to_string()]));
+    let dir = store.pack_dir("trt-runtime", "11.4");
+    assert_eq!(std::fs::read(dir.join("nvinfer_11.dll")).unwrap(), b"nvinfer 11.4");
+    assert!(store::same_files(&store.installed("trt-runtime", "11.4").unwrap().files, &p.f.rt1.files));
+    assert_eq!(std::fs::read_dir(store.tmp_dir()).unwrap().count(), 0);
+    // the per-user store is as it was, and its own gc doesn't touch the copy
+    assert_eq!(snapshot(&p.user), before);
+    unref(&p.f.store, "other-app", &mut || {}).unwrap();
+    assert!(installed(&p.f.store).is_empty());
+    assert_eq!(std::fs::read(dir.join("nvinfer_11.dll")).unwrap(), b"nvinfer 11.4");
+    assert!(check_of(&store, &o).complete);
+}
+
+#[test]
+fn a_bad_pack_in_the_per_user_store_is_downloaded_instead() {
+    let p = portable("take-shared-bad");
+    let other = app(&p.f.t, "other");
+    run(&p.f.store, &opts("other-app", &other, vec![p.f.rt1.clone(), p.f.models.clone()], &p.f.mirror)).unwrap();
+    // one file of the shared runtime is missing (its .pack.json still lists it), the models have other
+    // files than this index
+    std::fs::remove_file(p.f.store.pack_dir("trt-runtime", "11.4").join("trtexec.exe")).unwrap();
+    let models2 = make_pack(&p.f.mirror, "models-mangajanai", "1.0.0", "models", None, &[("a.onnx", b"model a v2")]);
+    let before = snapshot(&p.user);
+    conf::write(&p.conf, "runtime").unwrap();
+    let store = p.resolved().open().unwrap();
+    let o = opts("videojanai", &p.exe, vec![p.f.rt1.clone(), models2.clone()], &p.f.mirror);
+    let (states, _, r) = plan_states(&store, &EnsureOptions { check: true, ..clone_opts(&o) });
+    r.unwrap();
+    assert_eq!(states, vec![PlanState::Adopted, PlanState::Download], "the check can't see the missing file");
+    let (states, _, r) = plan_states(&store, &o);
+    let r = r.unwrap();
+    assert_eq!(states, vec![PlanState::Download, PlanState::Download]);
+    assert!(r.adopted.is_empty());
+    assert_eq!(std::fs::read(store.pack_dir("trt-runtime", "11.4").join("trtexec.exe")).unwrap(), b"trtexec");
+    assert_eq!(std::fs::read(store.pack_dir("models-mangajanai", "1.0.0").join("a.onnx")).unwrap(), b"model a v2");
+    assert_eq!(snapshot(&p.user), before);
+    assert_eq!(std::fs::read_dir(store.tmp_dir()).unwrap().count(), 0);
+}
+
+#[test]
+fn the_per_user_store_takes_nothing_from_itself() {
+    let f = fixture("take-self");
+    let a = app(&f.t, "a");
+    let store = Store::open(f.store.root()).unwrap().with_shared(Some(f.store.root().to_path_buf()));
+    run(&store, &opts("app-a", &a, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    let (states, _, _) = plan_states(&store, &opts("app-a", &a, vec![f.rt1.clone()], &f.mirror));
+    assert_eq!(states, vec![PlanState::Installed]);
+    // and the CLI's mode: the per-user store gets no shared store
+    let t = Tmp::new("take-self-conf");
+    let r = resolve_with(None, None, &t.path().join("none.conf"), f.store.root()).unwrap();
+    assert!(r.open().unwrap().shared_root().is_none());
+}
+
+// ---- `use`: switching a copy's store (switch.rs) ----
+
+use crate::switch::{Target, UseApp, use_store};
+
+fn use_app(p: &Portable, per_copy: bool) -> UseApp {
+    UseApp { app_id: "videojanai".into(), per_copy, app_path: p.exe.clone(), aji_dir: Some(p.aji.clone()) }
+}
+
+fn use_to(p: &Portable, target: Target, per_copy: bool) -> Result<switch::UseReport> {
+    use_store(&p.resolved(), &target, Some(&use_app(p, per_copy)), &mut || {}, &mut |_, _| {})
+}
+
+/// The app's check in the store its settings name now: complete with no mirror (nothing to download).
+fn copy_check(p: &Portable, packs: Vec<IndexPack>, per_copy: bool) -> EnsureResult {
+    let store = p.resolved().open_read_only().unwrap();
+    let mut o = p.opts(packs);
+    o.mirror = Some(p.f.t.path().join("no-mirror"));
+    o.check = true;
+    if per_copy { ensure_per_copy(&store, &o, &mut |_| {}).unwrap() } else { run(&store, &o).unwrap() }
+}
+
+#[test]
+fn use_moves_a_copy_from_the_per_user_store_into_its_folder() {
+    let p = portable("use-in");
+    let other = app(&p.f.t, "other");
+    run(&p.f.store, &opts("other-app", &other, vec![p.f.rt1.clone()], &p.f.mirror)).unwrap();
+    let packs = vec![p.f.rt1.clone(), p.f.models.clone()];
+    run(&p.f.store, &p.opts(packs.clone())).unwrap();
+    let mut seen = Vec::new();
+    let r = use_store(&p.resolved(), &Target::Path("runtime".into()), Some(&use_app(&p, false)), &mut || {}, &mut |d, t| {
+        seen.push((d, t))
+    })
+    .unwrap();
+    let inside = p.app_dir.join("runtime");
+    assert_eq!((r.root.clone(), r.setting.as_str(), r.relative), (paths::absolute(&inside), "runtime", true));
+    assert_eq!(r.copied, vec!["trt-runtime/11.4", "models-mangajanai/1.0.0"]);
+    let total: u64 = packs.iter().map(|x| x.installed_bytes).sum();
+    assert_eq!((seen.first(), seen.last()), (Some(&(0, total)), Some(&(total, total))));
+    assert_eq!(conf::read(&p.conf).unwrap().store.as_deref(), Some("runtime"));
+    // the new store: the packs, the ref in relative form, aji-runtime.json relative
+    let store = p.resolved().open().unwrap();
+    assert!(store.is_relative());
+    assert_eq!(installed(&store), vec!["models-mangajanai/1.0.0", "trt-runtime/11.4"]);
+    assert_eq!(store.read_ref("videojanai").unwrap().app_path, PathBuf::from("..").join("VideoJaNai.exe"));
+    assert_eq!(store.read_ref("videojanai").unwrap().app_version, "1.0");
+    assert!(json_of(&p.aji)["trt"].as_str().unwrap().starts_with(".."));
+    let c = copy_check(&p, packs.clone(), false);
+    assert!(c.complete, "{:?}", c.stale);
+    // the old store: the ref is gone, and what only this app used with it; the other app keeps its own
+    assert!(p.f.store.read_ref("videojanai").is_none());
+    assert_eq!(r.old_gc.as_ref().unwrap().deleted, vec!["models-mangajanai/1.0.0".to_string()]);
+    assert_eq!(installed(&p.f.store), vec!["trt-runtime/11.4"]);
+    assert!(!r.removed_old, "the per-user store is never removed");
+    assert!(p.f.store.root().join("store.json").is_file());
+    // and the folder moves with everything in it
+    let moved = p.f.t.path().join("Moved");
+    std::fs::rename(&p.app_dir, &moved).unwrap();
+    let res = resolve_with(None, None, &moved.join("aji-runtime.conf"), &p.user).unwrap();
+    let mut o = opts("videojanai", &moved.join("VideoJaNai.exe"), packs, &p.f.t.path().join("no-mirror"));
+    o.aji_dir = Some(moved.join("inference"));
+    assert!(check_of(&res.open_read_only().unwrap(), &o).complete);
+}
+
+#[test]
+fn use_moves_a_copy_from_its_folder_to_the_per_user_store() {
+    let p = portable("use-out");
+    conf::write(&p.conf, "runtime").unwrap();
+    let packs = vec![p.f.rt1.clone(), p.f.models.clone()];
+    ensure_per_copy(&p.resolved().open().unwrap(), &p.opts(packs.clone()), &mut |_| {}).unwrap();
+    let inside = p.app_dir.join("runtime");
+    let r = use_to(&p, Target::Shared, true).unwrap();
+    assert_eq!((r.root.as_path(), r.setting.as_str(), r.relative), (p.user.as_path(), "", false));
+    let text = std::fs::read_to_string(&p.conf).unwrap();
+    assert!(text.contains("\nstore = \n"), "the file stays, with an empty store: {text}");
+    assert_eq!(p.resolved().source, Source::Default);
+    // the per-user store has the copy's per-copy ref, absolute, and the packs
+    let id = copy_ref_id(&p.f.store, "videojanai", &p.exe).unwrap();
+    assert_eq!(r.ref_id.as_deref(), Some(id.as_str()));
+    assert_eq!(p.f.store.read_ref(&id).unwrap().app_path, p.exe);
+    assert_eq!(json_of(&p.aji)["trt"], p.f.store.pack_dir("trt-runtime", "11.4").to_string_lossy().as_ref());
+    assert!(copy_check(&p, packs, true).complete);
+    // the emptied store in the app's folder is removed (on Windows; elsewhere its lock file stays)
+    assert!(r.removed_old == cfg!(windows));
+    if cfg!(windows) {
+        assert!(!inside.exists());
+    } else {
+        assert_eq!(std::fs::read_dir(&inside).unwrap().map(|e| e.unwrap().file_name()).collect::<Vec<_>>(), ["lock"]);
+    }
+}
+
+#[test]
+fn use_moves_a_copy_from_its_folder_to_a_shared_custom_folder() {
+    let p = portable("use-custom");
+    conf::write(&p.conf, "runtime").unwrap();
+    let packs = vec![p.f.rt1.clone()];
+    run(&p.resolved().open().unwrap(), &p.opts(packs.clone())).unwrap();
+    // something the user put in the old store's folder: that folder stays, with it
+    let inside = p.app_dir.join("runtime");
+    std::fs::write(inside.join("notes.txt"), b"mine").unwrap();
+    let custom = p.f.t.path().join("D").join("AI runtime");
+    let r = use_to(&p, Target::Path(custom.to_string_lossy().into_owned()), false).unwrap();
+    assert_eq!((r.root.clone(), r.relative), (custom.clone(), false));
+    assert_eq!(p.resolved().root, custom);
+    let store = p.resolved().open().unwrap();
+    assert_eq!(store.read_ref("videojanai").unwrap().app_path, p.exe);
+    assert!(copy_check(&p, packs, false).complete);
+    assert!(!r.removed_old);
+    assert!(inside.join("notes.txt").is_file());
+    assert!(!inside.join("store.json").exists() && !inside.join("packs").exists(), "the store's own files went");
+    // a second copy of the app pointed at the same folder shares it
+    let second = p.f.t.path().join("Second").join("VideoJaNai.exe");
+    std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+    std::fs::write(&second, b"exe").unwrap();
+    let conf2 = second.parent().unwrap().join("aji-runtime.conf");
+    conf::write(&conf2, &custom.to_string_lossy()).unwrap();
+    let s2 = resolve_with(None, None, &conf2, &p.user).unwrap().open().unwrap();
+    let empty = p.f.t.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let (states, _, r) = plan_states(&s2, &opts("videojanai", &second, vec![p.f.rt1.clone()], &empty));
+    r.unwrap();
+    assert_eq!(states, vec![PlanState::Installed]);
+}
+
+#[test]
+fn use_rewrites_the_same_store_in_another_form() {
+    let p = portable("use-same");
+    let inside = p.app_dir.join("runtime");
+    conf::write(&p.conf, &inside.to_string_lossy()).unwrap();
+    let packs = vec![p.f.rt1.clone()];
+    let abs = p.resolved().open().unwrap();
+    assert!(!abs.is_relative());
+    ensure_per_copy(&abs, &p.opts(packs.clone()), &mut |_| {}).unwrap();
+    let old_id = copy_ref_id(&abs, "videojanai", &p.exe).unwrap();
+    let r = use_to(&p, Target::Path("runtime".into()), true).unwrap();
+    assert!(r.copied.is_empty() && r.old_gc.is_none());
+    let store = p.resolved().open().unwrap();
+    assert!(store.is_relative());
+    let new_id = copy_ref_id(&store, "videojanai", &p.exe).unwrap();
+    assert_ne!(new_id, old_id);
+    assert!(store.read_ref(&old_id).is_none());
+    assert_eq!(store.read_ref(&new_id).unwrap().app_path, PathBuf::from("..").join("VideoJaNai.exe"));
+    assert_eq!(store.refs().len(), 1);
+    assert!(json_of(&p.aji)["trt"].as_str().unwrap().starts_with(".."));
+    assert_eq!(installed(&store), vec!["trt-runtime/11.4"]);
+    assert!(copy_check(&p, packs.clone(), true).complete);
+    // and back to absolute
+    use_to(&p, Target::Path(inside.to_string_lossy().into_owned()), true).unwrap();
+    assert!(!p.resolved().relative);
+    assert!(copy_check(&p, packs, true).complete);
+}
+
+#[test]
+fn use_without_a_ref_only_writes_the_settings_file() {
+    let p = portable("use-no-ref");
+    let r = use_store(&p.resolved(), &Target::Path("runtime".into()), None, &mut || {}, &mut |_, _| {}).unwrap();
+    assert!(r.ref_id.is_none());
+    assert_eq!(p.resolved().source, Source::Settings);
+    assert!(!p.app_dir.join("runtime").exists(), "created by the first install");
+    // with an app id but no ref, or with only another copy's plain ref, the same
+    let other = app(&p.f.t, "other-copy");
+    run(&p.f.store, &opts("videojanai", &other, vec![p.f.rt1.clone()], &p.f.mirror)).unwrap();
+    let p2 = Portable { conf: p.f.t.path().join("c2.conf"), ..p };
+    let r = use_to(&p2, Target::Path("rt2".into()), false).unwrap();
+    assert!(r.ref_id.is_none());
+    assert_eq!(p2.f.store.read_ref("videojanai").unwrap().app_path, other, "the other copy's ref is left alone");
+}
+
+#[test]
+fn use_refuses_bad_targets_and_changes_nothing() {
+    let p = portable("use-refused");
+    run(&p.f.store, &p.opts(vec![p.f.rt1.clone()])).unwrap();
+    let full = p.app_dir.join("full");
+    std::fs::create_dir_all(&full).unwrap();
+    std::fs::write(full.join("x.txt"), b"x").unwrap();
+    let e = use_to(&p, Target::Path("full".into()), false).unwrap_err().to_string();
+    assert!(e.contains("isn't empty"), "{e}");
+    let e = use_to(&p, Target::Path(p.user.join("packs").join("new").to_string_lossy().into_owned()), false).unwrap_err().to_string();
+    assert!(e.contains("inside"), "{e}");
+    let e = use_to(&p, Target::Path(".".into()), false).unwrap_err().to_string();
+    assert!(e.contains("isn't empty"), "the app's own folder: {e}");
+    #[cfg(windows)]
+    {
+        let e = use_to(&p, Target::Path("\\\\server\\share\\aji".into()), false).unwrap_err().to_string();
+        assert!(e.contains("network"), "{e}");
+    }
+    assert!(!p.conf.exists());
+    assert!(p.f.store.read_ref("videojanai").is_some());
+    // a store whose root is a parent of the current one
+    conf::write(&p.conf, &Path::new("runtime").join("inner").to_string_lossy()).unwrap();
+    let e = use_to(&p, Target::Path("runtime".into()), false).unwrap_err().to_string();
+    assert!(e.contains("inside"), "{e}");
+    // an existing store is fine to switch to; so is the per-user path given as a folder (= --shared)
+    conf::write(&p.conf, "").unwrap();
+    let r = use_to(&p, Target::Path(p.user.to_string_lossy().into_owned()), false).unwrap();
+    assert_eq!((r.setting.as_str(), r.root.as_path()), ("", p.user.as_path()));
+}
+
+#[test]
+fn a_failed_use_leaves_the_copy_working() {
+    let p = portable("use-failed");
+    let packs = vec![p.f.rt1.clone(), p.f.models.clone()];
+    run(&p.f.store, &p.opts(packs.clone())).unwrap();
+    let json_before = std::fs::read(p.aji.join("aji-runtime.json")).unwrap();
+    // aji-runtime.json can't be written (its folder is gone): undone after the packs were copied
+    let bad = UseApp { aji_dir: Some(p.app_dir.join("no-such-folder")), ..use_app(&p, false) };
+    let e = use_store(&p.resolved(), &Target::Path("runtime".into()), Some(&bad), &mut || {}, &mut |_, _| {});
+    assert!(e.is_err());
+    assert!(!p.conf.exists(), "the settings file wasn't written");
+    let inside = Store::open(&p.app_dir.join("runtime")).unwrap();
+    assert!(inside.read_ref("videojanai").is_none(), "the new store's ref was undone");
+    assert!(p.f.store.read_ref("videojanai").is_some(), "the old ref is there");
+    assert_eq!(std::fs::read(p.aji.join("aji-runtime.json")).unwrap(), json_before);
+    assert!(copy_check(&p, packs.clone(), false).complete, "the copy still works on the per-user store");
+    // the packs copied in meanwhile are harmless: unreferenced, freed by the next gc
+    assert_eq!(installed(&inside).len(), 2);
+    let lock = inside.lock(&mut || {}).unwrap();
+    assert_eq!(inside.gc(&lock).unwrap().deleted.len(), 2);
+    drop(lock);
+    // a pack the old store lacks: refused before anything is written
+    std::fs::remove_file(p.f.store.pack_dir("models-mangajanai", "1.0.0").join(".pack.json")).unwrap();
+    let e = use_to(&p, Target::Path("runtime".into()), false).unwrap_err().to_string();
+    assert!(e.contains("isn't complete") && e.contains("Nothing was changed"), "{e}");
+    assert!(!p.conf.exists());
+    assert!(p.f.store.read_ref("videojanai").is_some());
+    assert!(inside.read_ref("videojanai").is_none());
+}
+
+#[test]
+fn opposite_uses_dont_deadlock() {
+    // two copies of the app switching in opposite directions at once: each holds one store's lock at a
+    // time, so both finish
+    let t = Tmp::new("use-opposite");
+    let user = t.path().join("user");
+    let mirror = t.path().join("mirror");
+    let rt = make_pack(&mirror, "trt-runtime", "11.4", "trt", None, &[("nvinfer_11.dll", b"nvinfer 11.4")]);
+    let custom = t.path().join("custom");
+    let mk = |name: &str, conf_value: &str| {
+        let dir = t.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("app.exe");
+        std::fs::write(&exe, b"exe").unwrap();
+        let conf_file = dir.join("aji-runtime.conf");
+        conf::write(&conf_file, conf_value).unwrap();
+        let res = resolve_with(None, None, &conf_file, &user).unwrap();
+        ensure_per_copy(&res.open().unwrap(), &opts("app", &exe, vec![rt.clone()], &mirror), &mut |_| {}).unwrap();
+        (conf_file, exe)
+    };
+    let a = mk("a", "");
+    let b = mk("b", &custom.to_string_lossy());
+    let mut handles = Vec::new();
+    for ((conf_file, exe), start_shared) in [(a, true), (b, false)] {
+        let (user, custom) = (user.clone(), custom.clone());
+        handles.push(std::thread::spawn(move || {
+            let app = UseApp { app_id: "app".into(), per_copy: true, app_path: exe, aji_dir: None };
+            for round in 0..4 {
+                let to_custom = start_shared == (round % 2 == 0);
+                let target = if to_custom { Target::Path(custom.to_string_lossy().into_owned()) } else { Target::Shared };
+                let res = resolve_with(None, None, &conf_file, &user).unwrap();
+                let r = use_store(&res, &target, Some(&app), &mut || {}, &mut |_, _| {}).unwrap();
+                assert!(r.ref_id.is_some(), "round {round}: the ref went along");
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(Store::open(&user).unwrap().refs().len(), 1);
+    assert_eq!(Store::open(&custom).unwrap().refs().len(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn an_emptied_store_keeps_a_lock_file_someone_has_open() {
+    // a process waiting in Store::lock has the lock file open (std shares delete): deleting it would
+    // let that waiter and a third process both hold "the" lock
+    let t = Tmp::new("remove-lock-open");
+    let root = t.path().join("store");
+    let store = Store::open(&root).unwrap();
+    let lock = store.lock(&mut || {}).unwrap();
+    let waiter =
+        std::fs::File::options().read(true).write(true).create(true).truncate(false).open(root.join("lock")).unwrap();
+    assert!(!store.remove_if_empty(lock));
+    assert!(root.join("lock").is_file(), "the lock file stays");
+    assert!(root.is_dir(), "and so does the folder");
+    assert!(!root.join("store.json").exists(), "the store's other files went");
+    drop(waiter);
+    // nobody else has it open: the lock file and the folder go
+    let store = Store::open(&root).unwrap();
+    let lock = store.lock(&mut || {}).unwrap();
+    assert!(store.remove_if_empty(lock));
+    assert!(!root.exists());
+}
+
+// ---- `unref --app-path` without `--per-copy`: only this copy's plain ref ----
+// An older portable copy (from before per-copy ids) may have taken the plain id over: the installed
+// copy's uninstaller must not drop that copy's ref and free the packs it's using.
+
+#[test]
+fn unref_for_path_drops_only_this_copys_ref() {
+    let f = fixture("unref-for-path");
+    let (installed_copy, portable_copy) = (app(&f.t, "installed"), app(&f.t, "portable"));
+    // the portable copy took the plain ref over
+    run(&f.store, &opts("mpv-animejanai", &portable_copy, vec![f.rt1.clone(), f.models.clone()], &f.mirror)).unwrap();
+    let (had, other, gc) = unref_for_path(&f.store, "mpv-animejanai", &installed_copy, &mut || {}).unwrap();
+    assert!(!had);
+    assert_eq!(other.as_deref(), Some(portable_copy.as_path()));
+    assert!(gc.deleted.is_empty(), "{:?}", gc.deleted);
+    assert_eq!(f.store.read_ref("mpv-animejanai").unwrap().app_path, portable_copy, "left as it is");
+    assert_eq!(installed(&f.store), vec!["models-mangajanai/1.0.0", "trt-runtime/11.4"]);
+    // the ref naming this copy (its exe already removed by the uninstaller) is dropped, its packs freed
+    std::fs::remove_file(&portable_copy).unwrap();
+    let (had, other, gc) = unref_for_path(&f.store, "mpv-animejanai", &portable_copy, &mut || {}).unwrap();
+    assert!(had && other.is_none());
+    assert_eq!(gc.deleted, vec!["models-mangajanai/1.0.0".to_string(), "trt-runtime/11.4".to_string()]);
+    assert!(f.store.read_ref("mpv-animejanai").is_none());
+    // no ref at all: nothing to drop, nothing left alone
+    let (had, other, _) = unref_for_path(&f.store, "mpv-animejanai", &installed_copy, &mut || {}).unwrap();
+    assert!(!had && other.is_none());
+}
+
+#[test]
+fn unref_for_path_resolves_a_relative_ref_against_the_store_root() {
+    let p = portable("unref-for-path-rel");
+    conf::write(&p.conf, "runtime").unwrap();
+    let store = p.resolved().open().unwrap();
+    run(&store, &p.opts(vec![p.f.rt1.clone()])).unwrap();
+    assert!(store.read_ref("videojanai").unwrap().app_path.is_relative());
+    // another exe: left alone, reported by its resolved path
+    let other = app(&p.f.t, "other");
+    let (had, left, _) = unref_for_path(&store, "videojanai", &other, &mut || {}).unwrap();
+    assert!(!had);
+    assert!(paths::same_path(&left.unwrap(), &p.exe));
+    assert!(store.read_ref("videojanai").is_some());
+    // this copy's exe, as an absolute path: the relative ref names it
+    let (had, left, gc) = unref_for_path(&store, "videojanai", &p.exe, &mut || {}).unwrap();
+    assert!(had && left.is_none());
+    assert_eq!(gc.deleted, vec!["trt-runtime/11.4".to_string()]);
+}
+
+#[test]
+fn plain_unref_still_drops_the_ref_whatever_it_names() {
+    // released uninstallers call `unref --app-id ID` alone
+    let f = fixture("unref-plain-any");
+    let other = app(&f.t, "other");
+    run(&f.store, &opts("mpv-animejanai", &other, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    let (had, gc) = unref(&f.store, "mpv-animejanai", &mut || {}).unwrap();
+    assert!(had);
+    assert_eq!(gc.deleted, vec!["trt-runtime/11.4".to_string()]);
+}

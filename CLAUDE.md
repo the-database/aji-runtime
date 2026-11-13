@@ -14,8 +14,12 @@ the-database/animejan.ai.
   animejanai-inference `scripts/runtime_packs.py`) and pack selection.
 - `fetch.rs`: downloads and extraction.
 - `nvml.rs`: NVIDIA GPU detection (copied from MangaJaNaiCLI).
-- `lib.rs`: `ensure` / `adopt` / `install` / `unref`, and `aji-runtime.json` (read by libaji's
-  `core/runtime_packs`).
+- `lib.rs`: `ensure` / `adopt` / `install` / `unref` (and their `--per-copy` forms), copying packs
+  between stores, and `aji-runtime.json` (read by libaji's `core/runtime_packs`).
+- `settings.rs`: which store a command uses (`--store` > `AJI_RUNTIME_STORE` > `aji-runtime.conf`
+  beside the executable > the per-user store), the settings file's parser and writer.
+- `switch.rs`: `use`, switching the store a copy uses. `location.rs`: `move` / `reset` of the
+  per-user store. `paths.rs`: relative paths and path comparison.
 
 ## Rules that must not break
 
@@ -23,7 +27,30 @@ the-database/animejan.ai.
 store rule has a test in `src/tests.rs`. Add one for any change.
 
 - A pack is deleted only when no live ref lists it. A ref is live if it parses and its
-  `app_path` exists.
+  `app_path` exists. A relative `app_path` is resolved against the store's root, in every store
+  however it was opened (never against the current folder): a store in relative mode moved with
+  its app's folder keeps its packs, and one whose exe is gone frees them.
+- Relative mode (the store came from the settings file as a relative path) writes the ref's
+  `app_path` relative to the store root and `aji-runtime.json`'s pack folders relative to its own
+  folder (absolute when there's no relative path, another drive). Outside it, everything is
+  absolute as before. `ensure --check` compares against the form this mode writes.
+- Per-copy refs (`ID-<8 hex>` of the app path in the ref's form): a plain `ID` ref is taken over
+  or dropped only when it names the same app path. A plain ref naming another path belongs to
+  another copy and is never touched. So is it by `unref --app-id ID --app-path EXE` (no
+  `--per-copy`): it drops the plain ref only when it names EXE (resolved against the store root),
+  else leaves it, says so on stderr and exits 0. Only `unref` without `--app-path` (released
+  uninstallers) drops it whatever it names.
+- A pack copied from another store (the per-user one in `ensure`, the old one in `use`) is staged in
+  `tmp/` and renamed in like any install, checked against its `.pack.json`. The source store is
+  never locked and never changed; in `ensure` any error falls back to downloading.
+- `use` holds one store's lock at a time (the new store's, released before the old one's), so
+  opposite runs can't deadlock, and orders its steps so a failure leaves the copy working on one
+  store or the other. Removing an emptied store deletes only the store's own files (never an
+  app's `engines/` or anything else). Its lock file goes only when nobody else has it open (std
+  opens files with delete sharing, so a plain delete would succeed under a process waiting for the
+  lock and let two hold it): on Windows an exclusive, delete-on-close open; elsewhere it stays.
+- `move` and `reset` are for the per-user store; a store set in the settings file is changed with
+  `use`.
 - Everything that changes the store holds the lock. The functions take the `StoreLock` as a
   parameter, so they can't be called without it.
 - Pack folders are immutable, and complete only with `.pack.json`, which is written last. New
