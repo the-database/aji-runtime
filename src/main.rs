@@ -1,26 +1,32 @@
 //! The `aji-runtime` program: the pack store for app installers and uninstallers.
 //!
 //! ```text
-//! aji-runtime ensure --app-id ID --app-path EXE --index URL|FILE --index-sha256 HEX
+//! aji-runtime ensure --app-id ID [--per-copy] --app-path EXE --index URL|FILE --index-sha256 HEX
 //!                    [--want trt,trtrtx,PACK...] [--gpus auto|none|smNN,...] [--aji-dir DIR]
 //!                    [--app-version V] [--adopt-from DIR]... [--mirror DIR] [--check]
 //!                    [--progress lines] [--store DIR]
 //! aji-runtime adopt  --from DIR ...ensure's options      (ensure, taking matching old files first)
-//! aji-runtime unref  --app-id ID [--store DIR]           (uninstallers: drop the app's ref, then gc)
-//! aji-runtime gc     [--store DIR]
-//! aji-runtime list   [--store DIR]
-//! aji-runtime path   NAME[/VERSION] [--app-id ID] [--store DIR]
-//! aji-runtime show   --app-id ID [--store DIR]           (JSON: the app's packs, for its updater)
-//! aji-runtime location [--json] [--store DIR]             (where the store is, and if it's there)
-//! aji-runtime move   FOLDER|--default [--progress lines] [--store DIR]
-//! aji-runtime reset  [--store DIR]                       (drop a moved store whose folder is gone)
+//! aji-runtime unref  --app-id ID [--per-copy --app-path EXE]   (uninstallers: drop the ref, then gc)
+//! aji-runtime gc
+//! aji-runtime list
+//! aji-runtime path   NAME[/VERSION] [--app-id ID [--per-copy --app-path EXE]]
+//! aji-runtime show   --app-id ID [--per-copy --app-path EXE]   (JSON: the app's packs, for its updater)
+//! aji-runtime location [--json]                          (where the store is, and if it's there)
+//! aji-runtime move   FOLDER|--default [--progress lines] (the per-user store to another drive)
+//! aji-runtime reset                                      (drop a moved store whose folder is gone)
+//! aji-runtime use    FOLDER|--shared [--app-id ID [--per-copy] --app-path EXE [--aji-dir DIR]]
+//!                    [--progress lines]                  (switch the store this copy uses)
 //! ```
+//!
+//! Every command takes `--store DIR`. The store is `--store` > `AJI_RUNTIME_STORE` > the settings
+//! file `aji-runtime.conf` beside this program (`AJI_RUNTIME_CONF` names another) > the per-user
+//! store ([`aji_runtime::settings`]).
 //!
 //! `--progress lines` adds one event per stdout line, fields separated by single spaces:
 //! `AJI_WAIT` (another installer holds the store), `AJI_PLAN <name>/<version> <bytes>
 //! installed|adopted|download`, `AJI_TOTAL <bytes>`, `AJI_DOWNLOAD <name>/<version> <got> <total>`,
-//! `AJI_EXTRACT <name>/<version>`, `AJI_MOVE <copied> <total>` (bytes, while `move` copies),
-//! `AJI_DONE`. A failure prints `error: ...` on stderr and exits 1
+//! `AJI_EXTRACT <name>/<version>`, `AJI_MOVE <copied> <total>` (bytes, while `move` or `use`
+//! copies), `AJI_DONE`. A failure prints `error: ...` on stderr and exits 1
 //! without `AJI_DONE`. Human-readable progress always goes to stderr.
 
 use std::io::Write;
@@ -28,22 +34,28 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use aji_runtime::nvml::{self, Gpu};
-use aji_runtime::{EnsureOptions, Event, Index, PlanState, Store};
+use aji_runtime::settings::{Resolved, Source};
+use aji_runtime::{EnsureOptions, Event, Index, PlanState};
 
 const USAGE: &str = "usage:
-  aji-runtime ensure --app-id ID --app-path EXE --index URL|FILE --index-sha256 HEX
+  aji-runtime ensure --app-id ID [--per-copy] --app-path EXE --index URL|FILE --index-sha256 HEX
                      [--want trt,trtrtx,PACK...] [--gpus auto|none|smNN,...] [--aji-dir DIR]
                      [--app-version V] [--adopt-from DIR]... [--mirror DIR] [--check]
                      [--progress lines] [--store DIR]
   aji-runtime adopt  --from DIR (and ensure's options)
-  aji-runtime unref  --app-id ID [--store DIR]
+  aji-runtime unref  --app-id ID [--per-copy --app-path EXE] [--store DIR]
   aji-runtime gc     [--store DIR]
   aji-runtime list   [--store DIR]
-  aji-runtime path   NAME[/VERSION] [--app-id ID] [--store DIR]
-  aji-runtime show   --app-id ID [--store DIR]
+  aji-runtime path   NAME[/VERSION] [--app-id ID [--per-copy --app-path EXE]] [--store DIR]
+  aji-runtime show   --app-id ID [--per-copy --app-path EXE] [--store DIR]
   aji-runtime location [--json] [--store DIR]
   aji-runtime move   FOLDER|--default [--progress lines] [--store DIR]
-  aji-runtime reset  [--store DIR]";
+  aji-runtime reset  [--store DIR]
+  aji-runtime use    FOLDER|--shared [--app-id ID [--per-copy] --app-path EXE [--aji-dir DIR]]
+                     [--progress lines] [--store DIR]
+
+The store is --store, else AJI_RUNTIME_STORE, else the `store` setting in aji-runtime.conf beside
+this program (AJI_RUNTIME_CONF names another file), else the per-user store.";
 
 #[derive(Default)]
 struct Args {
@@ -64,6 +76,8 @@ struct Args {
     store: Option<PathBuf>,
     json: bool,
     to_default: bool,
+    per_copy: bool,
+    shared: bool,
 }
 
 fn parse() -> Result<Args, String> {
@@ -94,6 +108,8 @@ fn parse() -> Result<Args, String> {
             "--store" => a.store = Some(PathBuf::from(val()?)),
             "--json" => a.json = true,
             "--default" => a.to_default = true,
+            "--per-copy" => a.per_copy = true,
+            "--shared" => a.shared = true,
             "-h" | "--help" => return Err(USAGE.into()),
             s if s.starts_with("--") => return Err(format!("unknown option {s}\n{USAGE}")),
             _ => a.positional.push(x),
@@ -130,12 +146,21 @@ fn say(lines: bool, s: std::fmt::Arguments) {
     }
 }
 
-fn open_store(a: &Args) -> Result<Store, String> {
-    let root = match &a.store {
-        Some(p) => p.clone(),
-        None => Store::default_root().map_err(|e| e.to_string())?,
-    };
-    Store::open(&root).map_err(|e| e.to_string())
+/// The store this command uses (`--store` > `AJI_RUNTIME_STORE` > the settings file > per-user).
+fn resolved(a: &Args) -> Result<Resolved, String> {
+    aji_runtime::settings::resolve(a.store.as_deref()).map_err(|e| e.to_string())
+}
+
+fn open_store(a: &Args) -> Result<aji_runtime::Store, String> {
+    resolved(a)?.open().map_err(|e| e.to_string())
+}
+
+/// `--app-path`, required with `--per-copy`.
+fn copy_path(a: &Args) -> Result<Option<&std::path::Path>, String> {
+    match (a.per_copy, &a.app_path) {
+        (true, None) => Err("--per-copy needs --app-path".into()),
+        (_, p) => Ok(p.as_deref()),
+    }
 }
 
 fn ensure(a: &Args) -> Result<(), String> {
@@ -155,7 +180,8 @@ fn ensure(a: &Args) -> Result<(), String> {
     let want = if a.want.is_empty() { vec!["trt".to_string()] } else { a.want.clone() };
     let packs = index.select(&want, &gpus).map_err(|e| e.to_string())?;
     // a check creates nothing (not even an empty store) and takes no lock
-    let store = if a.check { Store::open_read_only(&store_root(a)?).map_err(|e| e.to_string())? } else { open_store(a)? };
+    let res = resolved(a)?;
+    let store = if a.check { res.open_read_only() } else { res.open() }.map_err(|e| e.to_string())?;
     eprintln!("Store: {}", store.root().display());
     let opts = EnsureOptions {
         app_id,
@@ -170,7 +196,8 @@ fn ensure(a: &Args) -> Result<(), String> {
     let lines = a.lines;
     let tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
     let mut shown = (String::new(), u64::MAX);
-    let r = aji_runtime::ensure(&store, &opts, &mut |ev| match ev {
+    let run = if a.per_copy { aji_runtime::ensure_per_copy } else { aji_runtime::ensure };
+    let r = run(&store, &opts, &mut |ev| match ev {
         Event::Waiting => {
             waiting_note(aji_runtime::store::LOCK_WAIT);
             say(lines, format_args!("AJI_WAIT"));
@@ -272,7 +299,7 @@ fn list(a: &Args) -> Result<(), String> {
                 "ref {} {} {} ({})",
                 x.app_id,
                 x.app_version,
-                x.app_path.display(),
+                store.resolve_path(&x.app_path).display(),
                 if r.live { "live" } else { "app gone" }
             ),
             None => println!("ref {} (unreadable)", r.file.display()),
@@ -288,7 +315,10 @@ fn path(a: &Args) -> Result<(), String> {
         Some(_) => want.clone(),
         None => {
             let candidates: Vec<String> = match &a.app_id {
-                Some(id) => store.read_ref(id).map(|r| r.packs).unwrap_or_default(),
+                Some(id) => aji_runtime::find_ref(&store, id, copy_path(a)?, a.per_copy)
+                    .map_err(|e| e.to_string())?
+                    .map(|(_, r)| r.packs)
+                    .unwrap_or_default(),
                 None => store.packs().into_iter().map(|(m, _, _)| aji_runtime::store::pack_key(&m.name, &m.version)).collect(),
             };
             let hits: Vec<String> = candidates.into_iter().filter(|k| k.split('/').next() == Some(want.as_str())).collect();
@@ -308,19 +338,27 @@ fn path(a: &Args) -> Result<(), String> {
 }
 
 /// `show`: the app's ref as JSON on stdout, for an updater to read what this app has:
-/// `{"store", "format", "app_id", "has_ref", "app_version", "app_path", "packs": [{"name", "version",
-/// "kind", "dir", "installed"}]}`. `app_path` (null without a ref) is the path the ref keeps the packs
-/// for: a ref naming another path than the app's own (a moved AppImage) is dead once that path is
-/// gone, so the app ensures again. Changes nothing (a missing store reads as empty).
+/// `{"store", "format", "app_id", "ref_id", "has_ref", "app_version", "app_path", "packs": [{"name",
+/// "version", "kind", "dir", "installed"}]}`. `app_path` (null without a ref) is the path the ref
+/// keeps the packs for, absolute: a ref naming another path than the app's own (a moved AppImage) is
+/// dead once that path is gone, so the app ensures again. `ref_id` is the ref read: with
+/// `--per-copy`, the copy's own, or the plain `app_id` ref while that still names this copy's path.
+/// Changes nothing (a missing store reads as empty).
 fn show(a: &Args) -> Result<(), String> {
     let id = a.app_id.clone().ok_or("--app-id is required")?;
     aji_runtime::store::check_component("app id", &id).map_err(|e| e.to_string())?;
-    let root = match &a.store {
-        Some(p) => p.clone(),
-        None => Store::default_root().map_err(|e| e.to_string())?,
+    let res = resolved(a)?;
+    let app_path = copy_path(a)?;
+    let store = res.open_existing();
+    // the id this copy's ref has (or would have): the store's mode decides its form
+    let looked = res.open_read_only().map_err(|e| e.to_string())?;
+    let found = aji_runtime::find_ref(store.as_ref().unwrap_or(&looked), &id, app_path, a.per_copy).map_err(|e| e.to_string())?;
+    let ref_id = match (&found, app_path) {
+        (Some((rid, _)), _) => rid.clone(),
+        (None, Some(p)) if a.per_copy => aji_runtime::copy_ref_id(&looked, &id, p).map_err(|e| e.to_string())?,
+        _ => id.clone(),
     };
-    let store = Store::open_existing(&root);
-    let r = store.as_ref().and_then(|s| s.read_ref(&id));
+    let r = found.map(|(_, r)| r);
     let packs: Vec<serde_json::Value> = match (&store, &r) {
         (Some(s), Some(r)) => r
             .packs
@@ -332,73 +370,62 @@ fn show(a: &Args) -> Result<(), String> {
                     "name": name,
                     "version": version,
                     "kind": meta.as_ref().map(|m| m.kind.clone()).unwrap_or_default(),
-                    "dir": s.pack_dir(name, version).to_string_lossy(),
+                    "dir": aji_runtime::paths::absolute(&s.pack_dir(name, version)).to_string_lossy(),
                     "installed": meta.is_some(),
                 })
             })
             .collect(),
         _ => Vec::new(),
     };
+    let app_path = |r: &aji_runtime::AppRef| aji_runtime::paths::absolute(&looked.resolve_path(&r.app_path)).to_string_lossy().into_owned();
     let out = serde_json::json!({
-        "store": root.to_string_lossy(),
+        "store": res.root.to_string_lossy(),
         "format": store.as_ref().map(|s| s.format()),
         "app_id": id,
+        "ref_id": ref_id,
         "has_ref": r.is_some(),
         "app_version": r.as_ref().map(|r| r.app_version.clone()),
-        "app_path": r.as_ref().map(|r| r.app_path.to_string_lossy().into_owned()),
+        "app_path": r.as_ref().map(app_path),
         "packs": packs,
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
     Ok(())
 }
 
-fn store_root(a: &Args) -> Result<PathBuf, String> {
-    match &a.store {
-        Some(p) => Ok(p.clone()),
-        None => Store::default_root().map_err(|e| e.to_string()),
-    }
-}
-
-/// `location`: `default <root>`, or `moved <root> -> <target> (available|missing)`; with `--json`,
-/// `{"root", "moved", "target", "available"}`. Changes nothing.
+/// `location`: `default <root>`, `moved <root> -> <target> (available|missing)`, or `settings <root>
+/// (from <file>)`; with `--json`, `{"root", "moved", "target", "available", "source", "setting",
+/// "relative", "settings_file", "default_root"}`. Changes nothing.
 fn location(a: &Args) -> Result<(), String> {
-    use aji_runtime::location::{Location, location};
-    let root = store_root(a)?;
-    let loc = location(&root);
+    let res = resolved(a)?;
     if a.json {
-        let (moved, target, available) = match &loc {
-            Location::Default => (false, None, true),
-            Location::Moved { target, available } => (true, Some(target.to_string_lossy().into_owned()), *available),
-        };
-        let out = serde_json::json!({"root": root.to_string_lossy(), "moved": moved, "target": target, "available": available});
-        println!("{}", serde_json::to_string_pretty(&out).unwrap());
-    } else {
-        match loc {
-            Location::Default => println!("default {}", root.display()),
-            Location::Moved { target, available } => {
-                println!("moved {} -> {} ({})", root.display(), target.display(), if available { "available" } else { "missing" })
-            }
+        println!("{}", serde_json::to_string_pretty(&res.location_json()).unwrap());
+        return Ok(());
+    }
+    let (moved, target, available) = res.location();
+    let root = res.root.display();
+    let state = if available { "available" } else { "missing" };
+    match (res.source, moved, target) {
+        (Source::Settings, false, _) => {
+            let missing = if available { "" } else { " (missing)" };
+            println!("settings {root} (from {}){missing}", res.settings_file.display())
         }
+        (_, true, Some(t)) => println!("moved {root} -> {} ({state})", t.display()),
+        _ => println!("default {root}"),
     }
     Ok(())
 }
 
 /// `move FOLDER` / `move --default`.
 fn move_store(a: &Args) -> Result<(), String> {
-    let root = store_root(a)?;
+    let res = resolved(a)?;
+    res.check_movable().map_err(|e| e.to_string())?;
+    let root = res.root.clone();
     let lines = a.lines;
     let mut waiting = || {
         say(lines, format_args!("AJI_WAIT"));
         waiting_note(aji_runtime::store::LOCK_WAIT);
     };
-    let mut last = 0u64;
-    let mut progress = |done: u64, total: u64| {
-        say(lines, format_args!("AJI_MOVE {done} {total}"));
-        if done == 0 || done == total || done - last >= 100_000_000 {
-            last = done;
-            eprintln!("Copying the store: {} of {}", mb(done), mb(total));
-        }
-    };
+    let mut progress = copy_progress(lines, "Copying the store");
     let r = match (a.to_default, a.positional.as_slice()) {
         (true, []) => aji_runtime::location::move_back(&root, &mut waiting, &mut progress),
         (false, [dest]) => aji_runtime::location::move_to(&root, std::path::Path::new(dest), &mut waiting, &mut progress),
@@ -409,6 +436,62 @@ fn move_store(a: &Args) -> Result<(), String> {
     match aji_runtime::location::location(&root) {
         aji_runtime::location::Location::Moved { target, .. } => eprintln!("The store is now in {} ({} links there).", target.display(), root.display()),
         aji_runtime::location::Location::Default => eprintln!("The store is in {}.", root.display()),
+    }
+    say(lines, format_args!("AJI_DONE"));
+    Ok(())
+}
+
+/// `AJI_MOVE <copied> <total>`, and a note every 100 MB on stderr.
+fn copy_progress(lines: bool, what: &'static str) -> impl FnMut(u64, u64) {
+    let mut last = 0u64;
+    move |done: u64, total: u64| {
+        say(lines, format_args!("AJI_MOVE {done} {total}"));
+        if done == 0 || done == total || done - last >= 100_000_000 {
+            last = done;
+            eprintln!("{what}: {} of {}", mb(done), mb(total));
+        }
+    }
+}
+
+/// `use FOLDER` / `use --shared`: switches the store this copy uses (its settings file), taking the
+/// app's packs along.
+fn use_store(a: &Args) -> Result<(), String> {
+    use aji_runtime::switch::{Target, UseApp, use_store};
+    let target = match (a.shared, a.positional.as_slice()) {
+        (true, []) => Target::Shared,
+        (false, [p]) => Target::Path(p.clone()),
+        _ => return Err(format!("use needs a folder, or --shared\n{USAGE}")),
+    };
+    let app = match &a.app_id {
+        Some(id) => Some(UseApp {
+            app_id: id.clone(),
+            per_copy: a.per_copy,
+            app_path: a.app_path.clone().ok_or("--app-id needs --app-path")?,
+            aji_dir: a.aji_dir.clone(),
+        }),
+        None if a.per_copy || a.aji_dir.is_some() => return Err("--per-copy and --aji-dir go with --app-id".into()),
+        None => None,
+    };
+    let res = resolved(a)?;
+    let lines = a.lines;
+    let mut waiting = || {
+        say(lines, format_args!("AJI_WAIT"));
+        waiting_note(aji_runtime::store::LOCK_WAIT);
+    };
+    let mut progress = copy_progress(lines, "Copying the runtime");
+    let r = use_store(&res, &target, app.as_ref(), &mut waiting, &mut progress).map_err(|e| e.to_string())?;
+    for w in &r.warnings {
+        eprintln!("Note: {w}");
+    }
+    if let Some(g) = &r.old_gc {
+        report_gc(g);
+    }
+    if r.removed_old {
+        eprintln!("Removed the empty store {}", res.root.display());
+    }
+    eprintln!("This copy now uses the store {} (set in {}).", r.root.display(), res.settings_file.display());
+    if matches!(res.source, Source::Env | Source::Flag) {
+        eprintln!("Note: {} still overrides the setting while it's given.", if res.source == Source::Env { "AJI_RUNTIME_STORE" } else { "--store" });
     }
     say(lines, format_args!("AJI_DONE"));
     Ok(())
@@ -427,8 +510,12 @@ fn run() -> Result<(), String> {
         "unref" => {
             let id = a.app_id.clone().ok_or("--app-id is required")?;
             let store = open_store(&a)?;
-            let (had, gc) = aji_runtime::unref(&store, &id, &mut || waiting_note(aji_runtime::UNREF_LOCK_WAIT))
-                .map_err(|e| e.to_string())?;
+            let mut wait = || waiting_note(aji_runtime::UNREF_LOCK_WAIT);
+            let (had, gc) = match copy_path(&a)? {
+                Some(p) if a.per_copy => aji_runtime::unref_per_copy(&store, &id, p, &mut wait),
+                _ => aji_runtime::unref(&store, &id, &mut wait),
+            }
+            .map_err(|e| e.to_string())?;
             if !had {
                 eprintln!("{id} had no ref");
             }
@@ -447,11 +534,13 @@ fn run() -> Result<(), String> {
         "location" => location(&a),
         "move" => move_store(&a),
         "reset" => {
-            let root = store_root(&a)?;
-            aji_runtime::location::reset(&root).map_err(|e| e.to_string())?;
-            eprintln!("The store is at the default path {} (empty until an app installs its packs again).", root.display());
+            let res = resolved(&a)?;
+            res.check_movable().map_err(|e| e.to_string())?;
+            aji_runtime::location::reset(&res.root).map_err(|e| e.to_string())?;
+            eprintln!("The store is at the default path {} (empty until an app installs its packs again).", res.root.display());
             Ok(())
         }
+        "use" => use_store(&a),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(())

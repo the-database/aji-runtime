@@ -12,7 +12,10 @@ pub mod fetch;
 pub mod index;
 pub mod location;
 pub mod nvml;
+pub mod paths;
+pub mod settings;
 pub mod store;
+pub mod switch;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -68,7 +71,8 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 pub enum PlanState {
     /// Already in the store.
     Installed,
-    /// Moved over from an app's old private files (`adopt_from`).
+    /// Moved over from an app's old private files (`adopt_from`), or copied from the per-user store
+    /// ([`Store::with_shared`]).
     Adopted,
     /// To download.
     Download,
@@ -132,19 +136,65 @@ fn have(store: &Store, p: &IndexPack) -> Result<bool> {
     Ok(true)
 }
 
+/// The ref id of one copy of an app (`--per-copy`): `<app_id>-<8 hex>`, the start of the SHA-256 of
+/// the copy's app path in the form the store's refs keep it ([`Store::path_form`], normalized by
+/// [`paths::path_key`]). In relative mode that's relative to the store, so it survives moving the
+/// whole folder.
+pub fn copy_ref_id(store: &Store, app_id: &str, app_path: &Path) -> Result<String> {
+    store::check_component("app id", app_id)?;
+    let key = paths::path_key(&store.path_form(app_path));
+    let id = format!("{app_id}-{}", &sha256_bytes(key.as_bytes())[..8]);
+    store::check_component("app id", &id)?;
+    Ok(id)
+}
+
+/// The ref an app (or, with `per_copy`, this copy of it at `app_path`) has, and its id. With
+/// `per_copy`, a plain `app_id` ref that names this same app path counts too (made before the app
+/// used per-copy refs); one naming another path never does.
+pub fn find_ref(store: &Store, app_id: &str, app_path: Option<&Path>, per_copy: bool) -> Result<Option<(String, AppRef)>> {
+    store::check_component("app id", app_id)?;
+    if !per_copy {
+        return Ok(store.read_ref(app_id).map(|r| (app_id.to_string(), r)));
+    }
+    let p = app_path.ok_or_else(|| err("--per-copy needs --app-path"))?;
+    let id = copy_ref_id(store, app_id, p)?;
+    if let Some(r) = store.read_ref(&id) {
+        return Ok(Some((id, r)));
+    }
+    Ok(plain_ref_for(store, app_id, p).map(|r| (app_id.to_string(), r)))
+}
+
+/// The plain `app_id` ref if it names `app_path`.
+pub(crate) fn plain_ref_for(store: &Store, app_id: &str, app_path: &Path) -> Option<AppRef> {
+    store.read_ref(app_id).filter(|r| store.names_path(&r.app_path, app_path))
+}
+
 /// Installs the app's packs, writes its ref (exactly these packs) and aji-runtime.json, then
 /// frees what no app uses any more. A failure leaves the store consistent and the app's old ref in
 /// place.
 pub fn ensure(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) -> Result<EnsureResult> {
+    ensure_as(store, opts, false, on)
+}
+
+/// [`ensure`] for one copy of an app that can have several on one PC: the ref is
+/// [`copy_ref_id`]'s (`opts.app_id` is the app's plain id). A plain `app_id` ref naming this same
+/// app path is removed once the per-copy ref is written; one naming another path is left alone.
+pub fn ensure_per_copy(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) -> Result<EnsureResult> {
+    ensure_as(store, opts, true, on)
+}
+
+fn ensure_as(store: &Store, opts: &EnsureOptions, per_copy: bool, on: &mut dyn FnMut(Event)) -> Result<EnsureResult> {
     store::check_component("app id", &opts.app_id)?;
     // A ref is live only while its app_path exists: a wrong one would have this very run's gc free
     // everything it just installed.
     if !opts.app_path.exists() {
         return Err(err(format!("--app-path {} does not exist (the app's executable)", opts.app_path.display())));
     }
+    let ref_id = if per_copy { copy_ref_id(store, &opts.app_id, &opts.app_path)? } else { opts.app_id.clone() };
     if opts.check {
-        return check(store, opts, on);
+        return check(store, opts, &ref_id, per_copy, on);
     }
+    let shared = shared_store(store);
     let lock = store.lock(&mut || on(Event::Waiting))?;
     if store.may_delete() {
         store.clean_tmp(&lock);
@@ -159,7 +209,9 @@ pub fn ensure(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) ->
     for (p, present) in opts.packs.iter().zip(present) {
         let state = if present {
             PlanState::Installed
-        } else if !opts.adopt_from.is_empty() && adopt(store, &lock, p, &opts.adopt_from)? {
+        } else if shared.as_ref().is_some_and(|s| shared_has(s, p) && take_shared(store, &lock, s, p))
+            || (!opts.adopt_from.is_empty() && adopt(store, &lock, p, &opts.adopt_from)?)
+        {
             adopted.push(p.key());
             PlanState::Adopted
         } else {
@@ -176,16 +228,20 @@ pub fn ensure(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) ->
     store.write_ref(
         &lock,
         &AppRef {
-            app_id: opts.app_id.clone(),
+            app_id: ref_id.clone(),
             app_version: opts.app_version.clone(),
-            app_path: opts.app_path.clone(),
+            app_path: store.path_form(&opts.app_path),
             packs: opts.packs.iter().map(IndexPack::key).collect(),
         },
     )?;
+    // the plain ref this copy had before it used a per-copy one
+    if per_copy && plain_ref_for(store, &opts.app_id, &opts.app_path).is_some() {
+        store.remove_ref(&lock, &opts.app_id)?;
+    }
     let packs: Vec<(IndexPack, PathBuf)> =
         opts.packs.iter().map(|p| (p.clone(), store.pack_dir(&p.name, &p.version))).collect();
     if let Some(dir) = &opts.aji_dir {
-        write_aji_runtime_json(dir, &packs)?;
+        write_aji_runtime_json(dir, &json_form(store, dir, &packs))?;
     }
     let gc = store.gc(&lock)?;
     on(Event::Done);
@@ -202,7 +258,8 @@ pub fn ensure(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) ->
 /// this `app_path` (and, with `aji_dir`, aji-runtime.json is what an ensure writes). A ref that names
 /// the app's old path (a moved or renamed AppImage) is dead for gc, which then frees the packs: such
 /// a check is incomplete, so the updater's ensure writes the ref again.
-fn check(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) -> Result<EnsureResult> {
+fn check(store: &Store, opts: &EnsureOptions, ref_id: &str, per_copy: bool, on: &mut dyn FnMut(Event)) -> Result<EnsureResult> {
+    let shared = shared_store(store);
     let mut present = Vec::with_capacity(opts.packs.len());
     for p in &opts.packs {
         present.push(match have(store, p) {
@@ -217,7 +274,9 @@ fn check(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) -> Resu
         // an adoption is planned without doing it: the old files are there with the pinned SHA-256s
         let state = if present {
             PlanState::Installed
-        } else if !opts.adopt_from.is_empty() && adoptable(p, &opts.adopt_from).is_some() {
+        } else if shared.as_ref().is_some_and(|s| shared_has(s, p))
+            || (!opts.adopt_from.is_empty() && adoptable(p, &opts.adopt_from).is_some())
+        {
             todo = true;
             PlanState::Adopted
         } else {
@@ -230,7 +289,7 @@ fn check(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) -> Resu
     on(Event::Total(total));
     let packs: Vec<(IndexPack, PathBuf)> =
         opts.packs.iter().map(|p| (p.clone(), store.pack_dir(&p.name, &p.version))).collect();
-    let stale = stale(store, opts, &packs);
+    let stale = stale(store, opts, ref_id, per_copy, &packs);
     Ok(EnsureResult {
         packs,
         downloaded_bytes: 0,
@@ -242,45 +301,127 @@ fn check(store: &Store, opts: &EnsureOptions, on: &mut dyn FnMut(Event)) -> Resu
 }
 
 /// What an ensure would write differently from what's there: the app's ref (it must list exactly
-/// these packs and name this app_path) and aji-runtime.json.
-fn stale(store: &Store, opts: &EnsureOptions, packs: &[(IndexPack, PathBuf)]) -> Vec<String> {
+/// these packs and name this app_path in the form this store writes it), aji-runtime.json, and with
+/// `per_copy` the plain ref this copy had before.
+fn stale(store: &Store, opts: &EnsureOptions, ref_id: &str, per_copy: bool, packs: &[(IndexPack, PathBuf)]) -> Vec<String> {
     let mut out = Vec::new();
-    match store.read_ref(&opts.app_id) {
-        None => out.push(format!("{} has no ref in the store", opts.app_id)),
+    match store.read_ref(ref_id) {
+        None => out.push(format!("{ref_id} has no ref in the store")),
         Some(r) => {
             let want: Vec<String> = opts.packs.iter().map(IndexPack::key).collect();
             let have: BTreeSet<&str> = r.packs.iter().map(String::as_str).collect();
             if have != want.iter().map(String::as_str).collect() {
-                out.push(format!("{}'s ref lists other packs ({})", opts.app_id, r.packs.join(", ")));
+                out.push(format!("{ref_id}'s ref lists other packs ({})", r.packs.join(", ")));
             }
-            if !same_path(&r.app_path, &opts.app_path) {
-                out.push(format!("{}'s ref names another app path ({})", opts.app_id, r.app_path.display()));
+            if !same_form(&r.app_path, &store.path_form(&opts.app_path)) {
+                out.push(format!("{ref_id}'s ref names another app path ({})", r.app_path.display()));
             }
         }
+    }
+    if per_copy && plain_ref_for(store, &opts.app_id, &opts.app_path).is_some() {
+        out.push(format!("{}'s plain ref for this copy is still there", opts.app_id));
     }
     if let Some(dir) = &opts.aji_dir {
         let file = dir.join("aji-runtime.json");
         let current = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
-        if current.as_ref() != Some(&aji_runtime_json(packs)) {
+        if current.as_ref() != Some(&aji_runtime_json(&json_form(store, dir, packs))) {
             out.push(format!("{} is missing or names other packs", file.display()));
         }
     }
     out
 }
 
-/// Whether two app paths are the same (made absolute, and case-insensitively on Windows).
-fn same_path(a: &Path, b: &Path) -> bool {
-    let parts = |p: &Path| -> Vec<String> {
-        std::path::absolute(p)
-            .unwrap_or_else(|_| p.to_path_buf())
-            .components()
-            .map(|c| {
-                let s = c.as_os_str().to_string_lossy();
-                if cfg!(windows) { s.to_lowercase() } else { s.into_owned() }
-            })
-            .collect()
-    };
-    parts(a) == parts(b)
+/// Whether a ref's app path is `want` in the same form: both absolute and the same file, or both
+/// relative and the same relative path (case-insensitively on Windows).
+fn same_form(have: &Path, want: &Path) -> bool {
+    if have.is_absolute() != want.is_absolute() {
+        return false;
+    }
+    if want.is_absolute() { paths::same_path(have, want) } else { paths::path_key(have) == paths::path_key(want) }
+}
+
+/// The pack folders as aji-runtime.json in `aji_dir` names them: as they are, or in relative mode
+/// relative to `aji_dir` (absolute when there's no relative path, on another drive).
+pub fn json_form(store: &Store, aji_dir: &Path, packs: &[(IndexPack, PathBuf)]) -> Vec<(IndexPack, PathBuf)> {
+    packs.iter().map(|(p, d)| (p.clone(), json_dir(store, aji_dir, d))).collect()
+}
+
+/// One pack folder as aji-runtime.json in `aji_dir` names it ([`json_form`]).
+pub fn json_dir(store: &Store, aji_dir: &Path, dir: &Path) -> PathBuf {
+    if store.is_relative() {
+        paths::relative_to(aji_dir, dir).unwrap_or_else(|| dir.to_path_buf())
+    } else {
+        dir.to_path_buf()
+    }
+}
+
+/// The per-user store to take packs from, if this store has one ([`Store::with_shared`]) and it's
+/// another store.
+fn shared_store(store: &Store) -> Option<Store> {
+    let root = store.shared_root()?;
+    if paths::same_dir(root, store.root()) {
+        return None;
+    }
+    Store::open_existing(root)
+}
+
+/// Whether `shared` holds `p` complete, with the index's files (as [`have`] checks).
+fn shared_has(shared: &Store, p: &IndexPack) -> bool {
+    shared.installed(&p.name, &p.version).is_some_and(|m| store::same_files(&m.files, &p.files))
+}
+
+/// Copies `p` in from the per-user store; false (and nothing changed) on any error, to download it
+/// instead.
+fn take_shared(store: &Store, lock: &StoreLock, shared: &Store, p: &IndexPack) -> bool {
+    copy_pack(shared, store, lock, &p.name, &p.version, Some(&p.files), &mut |_| {}).is_ok()
+}
+
+/// Copies the complete pack `name/version` from the store `from` into `to` (holding `to`'s lock,
+/// never `from`'s): each file hard-linked, or copied when that fails (another drive), staged in
+/// `to`'s tmp/ and renamed in, with the `.pack.json` written last. The copy is checked against the
+/// `.pack.json` (the file count and sizes), and with `expect`, that lists exactly those files.
+/// `from` is only read. `progress` gets each file's bytes as it's done.
+pub fn copy_pack(
+    from: &Store,
+    to: &Store,
+    lock: &StoreLock,
+    name: &str,
+    version: &str,
+    expect: Option<&[PackFile]>,
+    progress: &mut dyn FnMut(u64),
+) -> Result<PathBuf> {
+    store::check_component("pack name", name)?;
+    store::check_component("pack version", version)?;
+    let key = store::pack_key(name, version);
+    let meta = from.installed(name, version).ok_or_else(|| err(format!("{key} isn't complete in {}", from.root().display())))?;
+    if expect.is_some_and(|e| !store::same_files(&meta.files, e)) {
+        return Err(err(format!("{key} in {} has other files", from.root().display())));
+    }
+    let src_dir = from.pack_dir(name, version);
+    let work = to.tmp_folder(lock, &format!("copy-{name}"))?;
+    let result = (|| {
+        let staged = work.join("pack");
+        std::fs::create_dir_all(&staged).map_err(|e| err(format!("{}: {e}", staged.display())))?;
+        for f in &meta.files {
+            index::check_rel_path(&f.path)?;
+            let (src, dst) = (src_dir.join(&f.path), staged.join(&f.path));
+            std::fs::create_dir_all(dst.parent().unwrap()).map_err(|e| err(format!("{}: {e}", dst.display())))?;
+            if std::fs::hard_link(&src, &dst).is_err() {
+                std::fs::copy(&src, &dst).map_err(|e| err(format!("copying {} to {}: {e}", src.display(), dst.display())))?;
+            }
+            progress(f.bytes);
+        }
+        let mut found = Vec::new();
+        list_files(&staged, &staged, &mut found);
+        let sizes_ok = meta.files.iter().all(|f| std::fs::metadata(staged.join(&f.path)).is_ok_and(|m| m.len() == f.bytes));
+        if found.len() != meta.files.len() || !sizes_ok {
+            return Err(err(format!("the copy of {key} doesn't match its .pack.json")));
+        }
+        store::write_atomic(&staged.join(".pack.json"), &serde_json::to_vec_pretty(&meta).unwrap())?;
+        to.commit_pack(lock, &staged, name, version)
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    result
 }
 
 /// Downloads (or copies from `mirror`), verifies and installs one pack.
@@ -402,22 +543,29 @@ pub fn adoptable(p: &IndexPack, from: &[PathBuf]) -> Option<Vec<PathBuf>> {
 
 /// aji-runtime.json beside libaji (animejanai-inference `core/runtime_packs.h`): the TensorRT,
 /// builder-resource and TensorRT-RTX pack folders to load from, and the app's model pack folders.
+/// A relative folder (relative mode) is relative to the file's folder.
 pub fn aji_runtime_json(packs: &[(IndexPack, PathBuf)]) -> serde_json::Value {
-    let s = |p: &PathBuf| serde_json::Value::String(p.to_string_lossy().into_owned());
+    let kinds: Vec<(&str, &Path)> = packs.iter().map(|(p, d)| (p.kind.as_str(), d.as_path())).collect();
+    runtime_json_of_kinds(&kinds)
+}
+
+/// [`aji_runtime_json`] from (kind, folder) pairs.
+pub fn runtime_json_of_kinds(packs: &[(&str, &Path)]) -> serde_json::Value {
+    let s = |p: &Path| serde_json::Value::String(p.to_string_lossy().into_owned());
     let mut v = serde_json::json!({ "format": 1 });
-    if let Some((_, d)) = packs.iter().find(|(p, _)| p.kind == "trt") {
+    if let Some((_, d)) = packs.iter().find(|(k, _)| *k == "trt") {
         v["trt"] = s(d);
     }
-    let builders: Vec<serde_json::Value> = packs.iter().filter(|(p, _)| p.kind == "trt-builder").map(|(_, d)| s(d)).collect();
+    let builders: Vec<serde_json::Value> = packs.iter().filter(|(k, _)| *k == "trt-builder").map(|(_, d)| s(d)).collect();
     if !builders.is_empty() {
         v["trt_builder"] = serde_json::Value::Array(builders);
     }
-    if let Some((_, d)) = packs.iter().find(|(p, _)| p.kind == "trtrtx") {
+    if let Some((_, d)) = packs.iter().find(|(k, _)| *k == "trtrtx") {
         v["trtrtx"] = s(d);
     }
     // For the app, not libaji (which skips keys it doesn't know): its model pack folders, so an app
     // that only knows its libaji folder (yosh's add-on) finds the models too.
-    let models: Vec<serde_json::Value> = packs.iter().filter(|(p, _)| p.kind == "models").map(|(_, d)| s(d)).collect();
+    let models: Vec<serde_json::Value> = packs.iter().filter(|(k, _)| *k == "models").map(|(_, d)| s(d)).collect();
     if !models.is_empty() {
         v["models"] = serde_json::Value::Array(models);
     }
@@ -425,7 +573,11 @@ pub fn aji_runtime_json(packs: &[(IndexPack, PathBuf)]) -> serde_json::Value {
 }
 
 pub fn write_aji_runtime_json(aji_dir: &Path, packs: &[(IndexPack, PathBuf)]) -> Result<()> {
-    let mut b = serde_json::to_vec_pretty(&aji_runtime_json(packs)).unwrap();
+    write_runtime_json_value(aji_dir, &aji_runtime_json(packs))
+}
+
+pub(crate) fn write_runtime_json_value(aji_dir: &Path, v: &serde_json::Value) -> Result<()> {
+    let mut b = serde_json::to_vec_pretty(v).unwrap();
     b.push(b'\n');
     store::write_atomic(&aji_dir.join("aji-runtime.json"), &b)
 }
@@ -440,6 +592,20 @@ pub const UNREF_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(
 pub fn unref(store: &Store, app_id: &str, on_wait: &mut dyn FnMut()) -> Result<(bool, GcReport)> {
     let lock = store.lock_within(UNREF_LOCK_WAIT, on_wait)?;
     let had = store.remove_ref(&lock, app_id)?;
+    let gc = store.gc(&lock)?;
+    Ok((had, gc))
+}
+
+/// [`unref`] for one copy of an app ([`ensure_per_copy`]): drops its per-copy ref, and the plain
+/// `app_id` ref if that names this same app path (never one naming another path), then gc.
+/// `app_path` needn't exist any more.
+pub fn unref_per_copy(store: &Store, app_id: &str, app_path: &Path, on_wait: &mut dyn FnMut()) -> Result<(bool, GcReport)> {
+    let id = copy_ref_id(store, app_id, app_path)?;
+    let lock = store.lock_within(UNREF_LOCK_WAIT, on_wait)?;
+    let mut had = store.remove_ref(&lock, &id)?;
+    if plain_ref_for(store, app_id, app_path).is_some() {
+        had |= store.remove_ref(&lock, app_id)?;
+    }
     let gc = store.gc(&lock)?;
     Ok((had, gc))
 }

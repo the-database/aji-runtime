@@ -1,6 +1,6 @@
 [package]
 name = "aji-runtime"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 description = "The shared runtime pack store for libaji apps: installs each TensorRT runtime and model pack once per user, shared between apps through per-app refs"

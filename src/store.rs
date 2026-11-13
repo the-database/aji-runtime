@@ -10,9 +10,14 @@
 //!   refs/<app-id>.json         one per installed app: the packs it uses
 //! ```
 //!
+//! A ref's `app_path` is absolute, or (written in relative mode, [`Store::with_relative`])
+//! relative to the store's root, so a store inside or beside an app's folder can be moved or copied
+//! with it. Liveness resolves a relative `app_path` against the root in every store.
+//!
 //! Rules (plans/shared-runtime-packs.md in the-database/animejan.ai):
 //! - A pack is deleted only when no live ref lists it. A ref is live if it parses and its
-//!   `app_path` exists; dead refs are removed by [`Store::gc`].
+//!   `app_path` exists (a relative one resolved against the store's root); dead refs are removed
+//!   by [`Store::gc`].
 //! - Everything that changes the store takes [`Store::lock`] first; the functions that change it
 //!   take the [`StoreLock`] as a parameter, so they can't be called without it. A waiter gives up
 //!   after [`LOCK_WAIT`] with an error, never by breaking the lock.
@@ -124,6 +129,10 @@ pub struct GcReport {
 pub struct Store {
     root: PathBuf,
     format: u32,
+    /// Relative mode: refs and aji-runtime.json get relative paths.
+    relative: bool,
+    /// Another store (the per-user one) whose complete packs are copied in instead of downloaded.
+    shared: Option<PathBuf>,
 }
 
 /// The exclusive store lock, held until dropped.
@@ -162,11 +171,17 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 impl Store {
-    /// The per-user store's default location.
+    /// The store to use when nothing names another: `AJI_RUNTIME_STORE`, else [`Store::user_root`].
+    /// (The `aji-runtime` program also reads the settings file beside it: [`crate::settings`].)
     pub fn default_root() -> Result<PathBuf> {
         if let Some(p) = std::env::var_os("AJI_RUNTIME_STORE").filter(|p| !p.is_empty()) {
             return Ok(PathBuf::from(p));
         }
+        Store::user_root()
+    }
+
+    /// The per-user store: `%LOCALAPPDATA%\the-database\aji` (Linux: `$XDG_DATA_HOME/the-database/aji`).
+    pub fn user_root() -> Result<PathBuf> {
         if cfg!(windows) {
             let base = std::env::var_os("LOCALAPPDATA").ok_or_else(|| err("LOCALAPPDATA is not set"))?;
             Ok(PathBuf::from(base).join("the-database").join("aji"))
@@ -196,14 +211,14 @@ impl Store {
                 FORMAT
             }
         };
-        Ok(Store { root: root.to_path_buf(), format })
+        Ok(Store { root: root.to_path_buf(), format, relative: false, shared: None })
     }
 
     /// Opens an existing store without creating anything (for lookups), or None.
     pub fn open_existing(root: &Path) -> Option<Store> {
         let b = fs::read(root.join("store.json")).ok()?;
         let format = serde_json::from_slice::<StoreJson>(&b).ok()?.format;
-        Some(Store { root: root.to_path_buf(), format })
+        Some(Store { root: root.to_path_buf(), format, relative: false, shared: None })
     }
 
     /// The store at `root` for reading only (`ensure --check`): creates nothing, and a store that
@@ -214,11 +229,50 @@ impl Store {
             Ok(b) => serde_json::from_slice::<StoreJson>(&b).map_err(|e| err(format!("{}: {e}", sj.display())))?.format,
             Err(_) => FORMAT,
         };
-        Ok(Store { root: root.to_path_buf(), format })
+        Ok(Store { root: root.to_path_buf(), format, relative: false, shared: None })
+    }
+
+    /// Relative mode: refs store `app_path` relative to the root and aji-runtime.json gets pack
+    /// paths relative to its folder, so a store inside or beside the app's folder moves with it.
+    pub fn with_relative(mut self, on: bool) -> Store {
+        self.relative = on;
+        self
+    }
+
+    pub fn is_relative(&self) -> bool {
+        self.relative
+    }
+
+    /// A store (the per-user one) whose complete packs [`crate::ensure`] copies in instead of
+    /// downloading them. It's only read, never locked or changed.
+    pub fn with_shared(mut self, root: Option<PathBuf>) -> Store {
+        self.shared = root;
+        self
+    }
+
+    pub fn shared_root(&self) -> Option<&Path> {
+        self.shared.as_deref()
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// A ref's `app_path` as a path to look at: a relative one is relative to the root.
+    pub fn resolve_path(&self, p: &Path) -> PathBuf {
+        if p.is_absolute() || p.has_root() { p.to_path_buf() } else { self.root.join(p) }
+    }
+
+    /// `app_path` in the form a ref in this store keeps it: absolute (normalized), or in relative
+    /// mode relative to the root (absolute when there's no relative path, on another drive).
+    pub fn path_form(&self, app_path: &Path) -> PathBuf {
+        let abs = crate::paths::absolute(app_path);
+        if self.relative { crate::paths::relative_to(&self.root, &abs).unwrap_or(abs) } else { abs }
+    }
+
+    /// Whether a ref's `app_path` names `app_path` (whatever form either is in).
+    pub fn names_path(&self, ref_path: &Path, app_path: &Path) -> bool {
+        crate::paths::same_path(&self.resolve_path(ref_path), app_path)
     }
 
     pub fn format(&self) -> u32 {
@@ -238,7 +292,7 @@ impl Store {
         self.root.join("packs").join(name).join(version)
     }
 
-    fn ref_file(&self, app_id: &str) -> PathBuf {
+    pub fn ref_file(&self, app_id: &str) -> PathBuf {
         self.root.join("refs").join(format!("{app_id}.json"))
     }
 
@@ -264,7 +318,11 @@ impl Store {
         let mut said = false;
         loop {
             match f.try_lock() {
-                Ok(()) => return Ok(StoreLock { _file: f }),
+                Ok(()) => {
+                    let lock = StoreLock { _file: f };
+                    self.restore_layout(&lock);
+                    return Ok(lock);
+                }
                 Err(fs::TryLockError::WouldBlock) => {}
                 Err(fs::TryLockError::Error(e)) => return Err(err(format!("{}: {e}", p.display()))),
             }
@@ -295,7 +353,11 @@ impl Store {
             .open(&p)
             .map_err(|e| err(format!("{}: {e}", p.display())))?;
         match f.try_lock() {
-            Ok(()) => Ok(Some(StoreLock { _file: f })),
+            Ok(()) => {
+                let lock = StoreLock { _file: f };
+                self.restore_layout(&lock);
+                Ok(Some(lock))
+            }
             Err(fs::TryLockError::WouldBlock) => Ok(None),
             Err(fs::TryLockError::Error(e)) => Err(err(format!("{}: {e}", p.display()))),
         }
@@ -372,7 +434,7 @@ impl Store {
                 continue;
             }
             let app_ref = fs::read(&p).ok().and_then(|b| serde_json::from_slice::<AppRef>(&b).ok());
-            let live = app_ref.as_ref().is_some_and(|r| r.app_path.exists());
+            let live = app_ref.as_ref().is_some_and(|r| self.resolve_path(&r.app_path).exists());
             out.push(RefEntry { file: p, app_ref, live });
         }
         out.sort_by(|a, b| a.file.cmp(&b.file));
@@ -508,6 +570,47 @@ impl Store {
             }
         }
         Ok(report)
+    }
+
+    /// Whether the store holds no pack folder and no ref file at all.
+    pub fn is_empty(&self) -> bool {
+        let empty = |d: PathBuf| fs::read_dir(d).map(|mut r| r.next().is_none()).unwrap_or(true);
+        self.pack_folders().is_empty() && empty(self.root.join("packs")) && empty(self.root.join("refs"))
+    }
+
+    /// Removes an empty store (no packs, no refs): only the store's own files and empty folders,
+    /// never anything else in its folder, which stays when something else is in it. Returns whether
+    /// the folder is gone. The lock file goes last, after the lock is released, and only where that's
+    /// safe: on Windows the delete fails while anyone else has it open. On other systems it stays
+    /// (removing a lock file another process has open would let two hold "the" lock), and so does the
+    /// folder. Whoever takes the lock next puts the layout back ([`Store::lock`]).
+    pub fn remove_if_empty(&self, lock: StoreLock) -> bool {
+        if !self.may_delete() || !self.is_empty() {
+            return false;
+        }
+        self.clean_tmp(&lock);
+        for d in ["tmp", "packs", "refs"] {
+            let _ = fs::remove_dir(self.root.join(d));
+        }
+        let _ = fs::remove_file(self.root.join("store.json"));
+        drop(lock);
+        if cfg!(windows) {
+            let _ = fs::remove_file(self.root.join("lock"));
+        }
+        // only if nothing else is in it
+        fs::remove_dir(&self.root).is_ok()
+    }
+
+    /// Puts back the folders and `store.json` if they're missing (an emptied store that another
+    /// `use` removed while this one waited for its lock). Under the lock.
+    fn restore_layout(&self, _lock: &StoreLock) {
+        for d in ["tmp", "packs", "refs"] {
+            let _ = fs::create_dir_all(self.root.join(d));
+        }
+        let sj = self.root.join("store.json");
+        if !sj.exists() {
+            let _ = write_atomic(&sj, &serde_json::to_vec_pretty(&StoreJson { format: self.format }).unwrap());
+        }
     }
 }
 
