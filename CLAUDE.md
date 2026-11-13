@@ -43,7 +43,9 @@ store rule has a test in `src/tests.rs`. Add one for any change.
 - `use` holds one store's lock at a time (the new store's, released before the old one's), so
   opposite runs can't deadlock, and orders its steps so a failure leaves the copy working on one
   store or the other. Removing an emptied store deletes only the store's own files (never an
-  app's `engines/` or anything else), and its lock file only on Windows.
+  app's `engines/` or anything else). Its lock file goes only when nobody else has it open (std
+  opens files with delete sharing, so a plain delete would succeed under a process waiting for the
+  lock and let two hold it): on Windows an exclusive, delete-on-close open; elsewhere it stays.
 - `move` and `reset` are for the per-user store; a store set in the settings file is changed with
   `use`.
 - Everything that changes the store holds the lock. The functions take the `StoreLock` as a

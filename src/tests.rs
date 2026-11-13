@@ -2259,3 +2259,26 @@ fn opposite_uses_dont_deadlock() {
     assert_eq!(Store::open(&user).unwrap().refs().len(), 1);
     assert_eq!(Store::open(&custom).unwrap().refs().len(), 1);
 }
+
+#[cfg(windows)]
+#[test]
+fn an_emptied_store_keeps_a_lock_file_someone_has_open() {
+    // a process waiting in Store::lock has the lock file open (std shares delete): deleting it would
+    // let that waiter and a third process both hold "the" lock
+    let t = Tmp::new("remove-lock-open");
+    let root = t.path().join("store");
+    let store = Store::open(&root).unwrap();
+    let lock = store.lock(&mut || {}).unwrap();
+    let waiter =
+        std::fs::File::options().read(true).write(true).create(true).truncate(false).open(root.join("lock")).unwrap();
+    assert!(!store.remove_if_empty(lock));
+    assert!(root.join("lock").is_file(), "the lock file stays");
+    assert!(root.is_dir(), "and so does the folder");
+    assert!(!root.join("store.json").exists(), "the store's other files went");
+    drop(waiter);
+    // nobody else has it open: the lock file and the folder go
+    let store = Store::open(&root).unwrap();
+    let lock = store.lock(&mut || {}).unwrap();
+    assert!(store.remove_if_empty(lock));
+    assert!(!root.exists());
+}

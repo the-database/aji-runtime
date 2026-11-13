@@ -162,7 +162,8 @@ Every command takes `--store DIR`.
   the new store lacks (hard links where possible; `AJI_MOVE` progress), writes the ref there, with
   `--aji-dir` rewrites `aji-runtime.json`, writes the settings file, and then drops the ref in the
   old store and frees what no app uses. An old store other than the per-user one that's left empty
-  is removed (only its own files). Without a ref, only the settings file is written; for the same
+  is removed: only its own files, and its `lock` file (with the folder) only when no other process
+  has it open, which is checked on Windows; on Linux the `lock` file and the folder stay. Without a ref, only the settings file is written; for the same
   store in another form (absolute to relative), the ref, `aji-runtime.json` and the settings file
   are rewritten. A failure leaves the copy working on one store or the other.
 

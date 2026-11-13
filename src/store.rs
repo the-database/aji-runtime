@@ -580,10 +580,15 @@ impl Store {
 
     /// Removes an empty store (no packs, no refs): only the store's own files and empty folders,
     /// never anything else in its folder, which stays when something else is in it. Returns whether
-    /// the folder is gone. The lock file goes last, after the lock is released, and only where that's
-    /// safe: on Windows the delete fails while anyone else has it open. On other systems it stays
-    /// (removing a lock file another process has open would let two hold "the" lock), and so does the
-    /// folder. Whoever takes the lock next puts the layout back ([`Store::lock`]).
+    /// the folder is gone. The lock file goes last, after the lock is released, and only when nobody
+    /// else has it open: removing a lock file another process has open (one waiting in
+    /// [`Store::lock`]) would let it lock the removed file while a third creates a new one, so two
+    /// would hold "the" lock. On Windows the lock file is opened exclusively (no sharing) with
+    /// delete-on-close: that open fails while anyone else has it open, and while it's held nobody can
+    /// open it, so it's deleted only when unused, and then the folder (if nothing else is in it). Any
+    /// other handle keeps the lock file and the folder. On other systems an exclusive open can't be
+    /// had, so the lock file always stays, and so does the folder. Whoever takes the lock next puts
+    /// the layout back ([`Store::lock`]).
     pub fn remove_if_empty(&self, lock: StoreLock) -> bool {
         if !self.may_delete() || !self.is_empty() {
             return false;
@@ -594,8 +599,8 @@ impl Store {
         }
         let _ = fs::remove_file(self.root.join("store.json"));
         drop(lock);
-        if cfg!(windows) {
-            let _ = fs::remove_file(self.root.join("lock"));
+        if !remove_unused_lock_file(&self.root.join("lock")) {
+            return false;
         }
         // only if nothing else is in it
         fs::remove_dir(&self.root).is_ok()
@@ -611,6 +616,39 @@ impl Store {
         if !sj.exists() {
             let _ = write_atomic(&sj, &serde_json::to_vec_pretty(&StoreJson { format: self.format }).unwrap());
         }
+    }
+}
+
+/// Deletes a store's lock file only if nobody else has it open; returns whether it's gone (true when
+/// there was none). Windows: opened with no sharing and delete-on-close, so the open fails while any
+/// other handle exists (std opens files sharing read, write and delete, so a plain delete would
+/// succeed under a waiter), and nobody can open it between the check and the delete. Elsewhere it
+/// always stays.
+fn remove_unused_lock_file(p: &Path) -> bool {
+    if !p.exists() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const DELETE: u32 = 0x0001_0000;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        let exclusive = fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+            .open(p);
+        match exclusive {
+            Ok(f) => {
+                drop(f); // deleted as the only handle closes
+                !p.exists()
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
