@@ -189,3 +189,26 @@ fn a_portable_copy_installs_inside_and_switches_to_the_shared_store() {
     assert!(ok && err.contains("Removed trt-runtime/11.4"), "{err}");
     assert!(!e.app().join("rt").join("packs").join("trt-runtime").exists());
 }
+
+#[test]
+fn unref_with_an_app_path_leaves_another_copys_ref() {
+    let e = Env::new("unref-path");
+    let (idx, pin, mirror) = index(&e.dir);
+    let other = e.dir.join("Portable").join("mpvnet.exe");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, b"exe").unwrap();
+    let (idx, mirror, other_s) = (idx.to_string_lossy().into_owned(), mirror.to_string_lossy().into_owned(), other.to_string_lossy().into_owned());
+    let (ok, _, err) = e.run(&[
+        "ensure", "--app-id", "mpv-animejanai", "--app-path", &other_s, "--index", &idx, "--index-sha256", &pin, "--want",
+        "trt-runtime", "--gpus", "none", "--mirror", &mirror,
+    ]);
+    assert!(ok, "{err}");
+    let exe = e.exe().to_string_lossy().into_owned();
+    let (ok, _, err) = e.run(&["unref", "--app-id", "mpv-animejanai", "--app-path", &exe]);
+    assert!(ok, "exit 0: {err}");
+    assert!(err.contains(&format!("mpv-animejanai's ref is for {}: left as it is", other.display())), "{err}");
+    assert_eq!(e.json(&["show", "--app-id", "mpv-animejanai"])["has_ref"], true);
+    let (ok, _, err) = e.run(&["unref", "--app-id", "mpv-animejanai", "--app-path", &other_s]);
+    assert!(ok && err.contains("Removed trt-runtime/11.4"), "{err}");
+    assert_eq!(e.json(&["show", "--app-id", "mpv-animejanai"])["has_ref"], false);
+}

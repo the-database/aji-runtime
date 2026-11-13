@@ -6,7 +6,7 @@
 //!                    [--app-version V] [--adopt-from DIR]... [--mirror DIR] [--check]
 //!                    [--progress lines] [--store DIR]
 //! aji-runtime adopt  --from DIR ...ensure's options      (ensure, taking matching old files first)
-//! aji-runtime unref  --app-id ID [--per-copy --app-path EXE]   (uninstallers: drop the ref, then gc)
+//! aji-runtime unref  --app-id ID [[--per-copy] --app-path EXE]  (uninstallers: drop the ref, then gc)
 //! aji-runtime gc
 //! aji-runtime list
 //! aji-runtime path   NAME[/VERSION] [--app-id ID [--per-copy --app-path EXE]]
@@ -43,7 +43,7 @@ const USAGE: &str = "usage:
                      [--app-version V] [--adopt-from DIR]... [--mirror DIR] [--check]
                      [--progress lines] [--store DIR]
   aji-runtime adopt  --from DIR (and ensure's options)
-  aji-runtime unref  --app-id ID [--per-copy --app-path EXE] [--store DIR]
+  aji-runtime unref  --app-id ID [[--per-copy] --app-path EXE] [--store DIR]
   aji-runtime gc     [--store DIR]
   aji-runtime list   [--store DIR]
   aji-runtime path   NAME[/VERSION] [--app-id ID [--per-copy --app-path EXE]] [--store DIR]
@@ -511,13 +511,17 @@ fn run() -> Result<(), String> {
             let id = a.app_id.clone().ok_or("--app-id is required")?;
             let store = open_store(&a)?;
             let mut wait = || waiting_note(aji_runtime::UNREF_LOCK_WAIT);
-            let (had, gc) = match copy_path(&a)? {
-                Some(p) if a.per_copy => aji_runtime::unref_per_copy(&store, &id, p, &mut wait),
-                _ => aji_runtime::unref(&store, &id, &mut wait),
+            let (had, other, gc) = match copy_path(&a)? {
+                Some(p) if a.per_copy => aji_runtime::unref_per_copy(&store, &id, p, &mut wait).map(|(h, g)| (h, None, g)),
+                // only this copy's ref: another copy may have the plain id (an older portable one)
+                Some(p) => aji_runtime::unref_for_path(&store, &id, p, &mut wait),
+                None => aji_runtime::unref(&store, &id, &mut wait).map(|(h, g)| (h, None, g)),
             }
             .map_err(|e| e.to_string())?;
-            if !had {
-                eprintln!("{id} had no ref");
+            match other {
+                Some(o) => eprintln!("{id}'s ref is for {}: left as it is", o.display()),
+                None if !had => eprintln!("{id} had no ref"),
+                None => {}
             }
             report_gc(&gc);
             Ok(())

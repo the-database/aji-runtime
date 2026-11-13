@@ -596,6 +596,27 @@ pub fn unref(store: &Store, app_id: &str, on_wait: &mut dyn FnMut()) -> Result<(
     Ok((had, gc))
 }
 
+/// [`unref`] that drops the plain `app_id` ref only when it names `app_path` (this copy's exe,
+/// which needn't exist any more; a relative ref path is resolved against the store root), then gc.
+/// A ref naming another path is another copy's (an older portable copy that took the plain id
+/// over) and is left as it is: returns `(false, Some(its path), gc)`. Otherwise `(had, None, gc)`.
+pub fn unref_for_path(
+    store: &Store,
+    app_id: &str,
+    app_path: &Path,
+    on_wait: &mut dyn FnMut(),
+) -> Result<(bool, Option<PathBuf>, GcReport)> {
+    store::check_component("app id", app_id)?;
+    let lock = store.lock_within(UNREF_LOCK_WAIT, on_wait)?;
+    let (had, other) = match store.read_ref(app_id) {
+        Some(r) if !store.names_path(&r.app_path, app_path) => (false, Some(paths::absolute(&store.resolve_path(&r.app_path)))),
+        // this copy's ref; or none, or an unreadable one, dropped as `unref` does (gc frees it anyway)
+        _ => (store.remove_ref(&lock, app_id)?, None),
+    };
+    let gc = store.gc(&lock)?;
+    Ok((had, other, gc))
+}
+
 /// [`unref`] for one copy of an app ([`ensure_per_copy`]): drops its per-copy ref, and the plain
 /// `app_id` ref if that names this same app path (never one naming another path), then gc.
 /// `app_path` needn't exist any more.

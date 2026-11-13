@@ -2282,3 +2282,60 @@ fn an_emptied_store_keeps_a_lock_file_someone_has_open() {
     assert!(store.remove_if_empty(lock));
     assert!(!root.exists());
 }
+
+// ---- `unref --app-path` without `--per-copy`: only this copy's plain ref ----
+// An older portable copy (from before per-copy ids) may have taken the plain id over: the installed
+// copy's uninstaller must not drop that copy's ref and free the packs it's using.
+
+#[test]
+fn unref_for_path_drops_only_this_copys_ref() {
+    let f = fixture("unref-for-path");
+    let (installed_copy, portable_copy) = (app(&f.t, "installed"), app(&f.t, "portable"));
+    // the portable copy took the plain ref over
+    run(&f.store, &opts("mpv-animejanai", &portable_copy, vec![f.rt1.clone(), f.models.clone()], &f.mirror)).unwrap();
+    let (had, other, gc) = unref_for_path(&f.store, "mpv-animejanai", &installed_copy, &mut || {}).unwrap();
+    assert!(!had);
+    assert_eq!(other.as_deref(), Some(portable_copy.as_path()));
+    assert!(gc.deleted.is_empty(), "{:?}", gc.deleted);
+    assert_eq!(f.store.read_ref("mpv-animejanai").unwrap().app_path, portable_copy, "left as it is");
+    assert_eq!(installed(&f.store), vec!["models-mangajanai/1.0.0", "trt-runtime/11.4"]);
+    // the ref naming this copy (its exe already removed by the uninstaller) is dropped, its packs freed
+    std::fs::remove_file(&portable_copy).unwrap();
+    let (had, other, gc) = unref_for_path(&f.store, "mpv-animejanai", &portable_copy, &mut || {}).unwrap();
+    assert!(had && other.is_none());
+    assert_eq!(gc.deleted, vec!["models-mangajanai/1.0.0".to_string(), "trt-runtime/11.4".to_string()]);
+    assert!(f.store.read_ref("mpv-animejanai").is_none());
+    // no ref at all: nothing to drop, nothing left alone
+    let (had, other, _) = unref_for_path(&f.store, "mpv-animejanai", &installed_copy, &mut || {}).unwrap();
+    assert!(!had && other.is_none());
+}
+
+#[test]
+fn unref_for_path_resolves_a_relative_ref_against_the_store_root() {
+    let p = portable("unref-for-path-rel");
+    conf::write(&p.conf, "runtime").unwrap();
+    let store = p.resolved().open().unwrap();
+    run(&store, &p.opts(vec![p.f.rt1.clone()])).unwrap();
+    assert!(store.read_ref("videojanai").unwrap().app_path.is_relative());
+    // another exe: left alone, reported by its resolved path
+    let other = app(&p.f.t, "other");
+    let (had, left, _) = unref_for_path(&store, "videojanai", &other, &mut || {}).unwrap();
+    assert!(!had);
+    assert!(paths::same_path(&left.unwrap(), &p.exe));
+    assert!(store.read_ref("videojanai").is_some());
+    // this copy's exe, as an absolute path: the relative ref names it
+    let (had, left, gc) = unref_for_path(&store, "videojanai", &p.exe, &mut || {}).unwrap();
+    assert!(had && left.is_none());
+    assert_eq!(gc.deleted, vec!["trt-runtime/11.4".to_string()]);
+}
+
+#[test]
+fn plain_unref_still_drops_the_ref_whatever_it_names() {
+    // released uninstallers call `unref --app-id ID` alone
+    let f = fixture("unref-plain-any");
+    let other = app(&f.t, "other");
+    run(&f.store, &opts("mpv-animejanai", &other, vec![f.rt1.clone()], &f.mirror)).unwrap();
+    let (had, gc) = unref(&f.store, "mpv-animejanai", &mut || {}).unwrap();
+    assert!(had);
+    assert_eq!(gc.deleted, vec!["trt-runtime/11.4".to_string()]);
+}

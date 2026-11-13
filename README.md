@@ -70,7 +70,7 @@ aji-runtime ensure --app-id ID [--per-copy] --app-path EXE --index URL|FILE --in
                    [--app-version V] [--adopt-from DIR]... [--mirror DIR] [--check]
                    [--progress lines] [--store DIR]
 aji-runtime adopt  --from DIR (and ensure's options)
-aji-runtime unref  --app-id ID [--per-copy --app-path EXE]
+aji-runtime unref  --app-id ID [[--per-copy] --app-path EXE]
 aji-runtime gc
 aji-runtime list
 aji-runtime path   NAME[/VERSION] [--app-id ID [--per-copy --app-path EXE]]
@@ -134,7 +134,11 @@ Every command takes `--store DIR`.
   absolute. `ref_id` is the ref it read (with `--per-copy`, the plain `ID` ref while that still
   names this copy's path). It changes nothing.
 - **`unref`**: uninstallers call it to drop the app's ref; it then frees what no app uses. With
-  `--per-copy`, it also drops a plain `ID` ref naming this copy's path.
+  `--app-path EXE` (EXE needn't exist any more), it drops the ref only when it names EXE: a ref
+  for another path is another copy's (an older portable copy that took the plain id over) and is
+  left as it is, with a note on stderr and exit code 0. Without `--app-path` it drops the ref
+  whatever it names, as before. With `--per-copy`, it drops the copy's own ref, and a plain `ID`
+  ref naming this copy's path.
 - **`location`** says where the store is: `default`, `moved` with its folder and whether it's
   reachable (a removable drive may be unplugged), or `settings <root> (from <file>)`. `--json`:
   `{"root", "moved", "target", "available", "source", "setting", "relative", "settings_file",
@@ -176,7 +180,8 @@ choice that other apps can point at too.
 ## Library
 
 `aji_runtime::{ensure, unref, adopt, app_packs, Index, Store}`. MangaJaNaiCLI's `setup` uses it.
-For several copies of one app: `ensure_per_copy`, `unref_per_copy`, `copy_ref_id`, `find_ref`.
+For several copies of one app: `ensure_per_copy`, `unref_per_copy`, `unref_for_path`, `copy_ref_id`,
+`find_ref`.
 Relative mode and taking packs from the per-user store are set on the store
 (`Store::with_relative`, `Store::with_shared`); `settings::resolve` opens the store the program
 would, and `switch::use_store` is `use`.

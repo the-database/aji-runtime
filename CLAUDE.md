@@ -36,7 +36,10 @@ store rule has a test in `src/tests.rs`. Add one for any change.
   absolute as before. `ensure --check` compares against the form this mode writes.
 - Per-copy refs (`ID-<8 hex>` of the app path in the ref's form): a plain `ID` ref is taken over
   or dropped only when it names the same app path. A plain ref naming another path belongs to
-  another copy and is never touched.
+  another copy and is never touched. So is it by `unref --app-id ID --app-path EXE` (no
+  `--per-copy`): it drops the plain ref only when it names EXE (resolved against the store root),
+  else leaves it, says so on stderr and exits 0. Only `unref` without `--app-path` (released
+  uninstallers) drops it whatever it names.
 - A pack copied from another store (the per-user one in `ensure`, the old one in `use`) is staged in
   `tmp/` and renamed in like any install, checked against its `.pack.json`. The source store is
   never locked and never changed; in `ensure` any error falls back to downloading.
